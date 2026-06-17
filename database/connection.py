@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -8,12 +9,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator, Optional
 
-from core.config import DATA_DIR
-
 logger = logging.getLogger(__name__)
-SETTINGS_DB_PATH = DATA_DIR / "settings.db"
-SCHEDULES_DB_PATH = DATA_DIR / "schedules.db"
-TEAMS_DB_PATH = DATA_DIR / "teams.db"
+
+IS_RAILWAY_ENV = os.path.exists("/data") or bool(
+    os.environ.get("RAILWAY_ENVIRONMENT_NAME")
+)
+DB_DIR = Path("/data") if IS_RAILWAY_ENV else Path("./data")
+SETTINGS_DB_PATH = DB_DIR / "settings.db"
+SCHEDULES_DB_PATH = DB_DIR / "schedules.db"
+TEAMS_DB_PATH = DB_DIR / "teams.db"
+
+
+def _ensure_db_directory() -> None:
+    DB_DIR.mkdir(parents=True, exist_ok=True)
 
 
 @dataclass(frozen=True)
@@ -26,7 +34,7 @@ class GuildSettings:
 
 
 def initialize_database() -> None:
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    _ensure_db_directory()
     logger.info(
         "Initializing SQLite databases. settings=%s schedules=%s teams=%s",
         SETTINGS_DB_PATH,
@@ -469,6 +477,7 @@ def set_schedule_message_id(guild_id: int, message_id: Optional[int]) -> None:
 
 @contextmanager
 def _connection(database_path: Path) -> Iterator[sqlite3.Connection]:
+    _ensure_db_directory()
     connection = sqlite3.connect(database_path, timeout=30)
     connection.row_factory = sqlite3.Row
     connection.execute("PRAGMA journal_mode=WAL")
