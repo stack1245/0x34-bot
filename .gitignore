@@ -1,0 +1,60 @@
+# Environment variables
+.env
+.env.*
+!.env.example
+
+# Python bytecode and caches
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Python tooling caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.nox/
+.tox/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
+
+# Build and packaging artifacts
+build/
+dist/
+site/
+pip-wheel-metadata/
+*.egg-info/
+*.egg
+
+# Runtime files and local databases
+*.log
+logs/
+data/*.db
+data/*.sqlite
+data/*.sqlite3
+
+# Dependency directories (multi-stack safety)
+node_modules/
+
+# IDE and editor settings
+.vscode/
+.idea/
+*.iml
+
+# OS temporary files
+.DS_Store
+.DS_Store?
+Thumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+.Spotlight-V100/
+.Trashes/
+._*
