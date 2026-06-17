@@ -173,7 +173,8 @@ class TeamContestModal(discord.ui.Modal):
         try:
             thread = await channel.create_thread(
                 name=self._build_thread_name(
-                    team_name=team_name, contest_name=contest_name
+                    team_name=team_name,
+                    contest_name=contest_name,
                 ),
                 type=discord.ChannelType.private_thread,
                 invitable=False,
@@ -181,7 +182,8 @@ class TeamContestModal(discord.ui.Modal):
             add_team_leader(interaction.guild_id, thread.id, interaction.user.id)
             rejoin_view = TeamContestRejoinView(thread_id=thread.id)
             announcement_message = await channel.send(
-                embed=contest_embed, view=rejoin_view
+                embed=contest_embed,
+                view=rejoin_view,
             )
             await thread.send(f"원본 공고: {announcement_message.jump_url}")
             if self.is_team_leader == "예":

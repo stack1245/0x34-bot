@@ -48,23 +48,24 @@ class TeamContestRejoinView(discord.ui.View):
     def __init__(self, *, thread_id: int) -> None:
         super().__init__(timeout=None)
         self.thread_id = thread_id
-        rejoin_button = discord.ui.Button(
-            style=discord.ButtonStyle.success,
-            label="🔓 스레드 참가",
-            custom_id=f"team_contest_rejoin:{thread_id}",
-        )
-        rejoin_button.callback = self._on_rejoin_button_clicked
-        self.add_item(rejoin_button)
 
-    async def _on_rejoin_button_clicked(
+    @discord.ui.button(
+        label="🔓 스레드 참가",
+        style=discord.ButtonStyle.success,
+        custom_id="team_contest_rejoin_button",
+    )
+    async def rejoin_button(
         self,
+        button: discord.ui.Button,
         interaction: discord.Interaction,
     ) -> None:
+        del button
+
         guild = interaction.guild
         guild_id = interaction.guild_id
         if guild is None or guild_id is None:
             embed = _build_error_embed(
-                title="❌ 서버 정보 확인 실패",
+                title="❌ 스레드 참가 실패",
                 description="## 상태\n- ❌ 이 버튼은 서버 내부에서만 사용할 수 있습니다.",
                 guild=guild,
             )
@@ -97,7 +98,7 @@ class TeamContestRejoinView(discord.ui.View):
             await thread.add_user(interaction.user)
         except Exception as error:
             logger.exception(
-                "Failed to add user through team contest rejoin button. guild_id=%s thread_id=%s user_id=%s",
+                "Failed to rejoin team contest thread via button. guild_id=%s thread_id=%s user_id=%s",
                 guild_id,
                 self.thread_id,
                 interaction.user.id,
@@ -111,9 +112,9 @@ class TeamContestRejoinView(discord.ui.View):
             await interaction.response.send_message(embed=embed, ephemeral=True)
             return
 
-        success_embed = _build_success_embed(
+        embed = _build_success_embed(
             title="✅ 스레드 복귀 성공",
             description="✅ 스레드 복귀 성공: 비공개 프로젝트 룸으로 안전하게 재진입되었습니다.",
             guild=guild,
         )
-        await interaction.response.send_message(embed=success_embed, ephemeral=True)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
