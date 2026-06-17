@@ -76,7 +76,7 @@ async def schedule_list(ctx: discord.ApplicationContext) -> None:
         title="📅 Team 0x34 일정 목록",
         description="\n".join(
             [
-                "## 교내·외 IT 대회 및 프로젝트 일정",
+                "## 교내·외 대회 및 프로젝트 일정",
                 SECTION_DIVIDER,
                 *lines,
             ]

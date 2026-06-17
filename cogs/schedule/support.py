@@ -23,7 +23,7 @@ def _apply_guild_footer(
     guild: discord.Guild | None,
 ) -> discord.Embed:
     icon_url = guild.icon.url if guild and guild.icon else None
-    footer_text = embed.footer.text or "Team 0x34 IT Operations"
+    footer_text = embed.footer.text or "Team 0x34"
     embed.set_footer(text=footer_text, icon_url=icon_url)
     return embed
 
@@ -154,7 +154,7 @@ async def update_live_dashboard(bot: discord.Bot, guild_id: int) -> None:
     schedules = get_schedules(guild_id)
     intro = "\n".join(
         [
-            "## 교내·외 IT 대회 및 프로젝트 일정 타임라인",
+            "## 교내·외 대회 및 프로젝트 일정 타임라인",
             "일정이 등록되거나 정리될 때마다 실시간으로 알아서 자동 동기화됩니다.",
             SECTION_DIVIDER,
         ]

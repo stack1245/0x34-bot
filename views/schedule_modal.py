@@ -260,7 +260,7 @@ class ScheduleModal(discord.ui.Modal):
 
         guild = interaction.guild
         icon_url = guild.icon.url if guild and guild.icon else None
-        footer_text = embed.footer.text or "Team 0x34 IT Operations"
+        footer_text = embed.footer.text or "Team 0x34"
         embed.set_footer(text=footer_text, icon_url=icon_url)
 
         if interaction.response.is_done():
