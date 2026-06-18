@@ -114,7 +114,10 @@ class TeamContestRejoinView(discord.ui.View):
 
         embed = _build_success_embed(
             title="✅ 스레드 복귀 성공",
-            description="✅ 스레드 복귀 성공: 비공개 프로젝트 룸으로 안전하게 재진입되었습니다.",
+            description=(
+                "✅ 스레드 복귀 성공: 비공개 프로젝트 룸으로 안전하게 재진입되었습니다.\n"
+                f"🔗 [스레드 바로 가기]({thread.jump_url})"
+            ),
             guild=guild,
         )
         await interaction.response.send_message(embed=embed, ephemeral=True)
