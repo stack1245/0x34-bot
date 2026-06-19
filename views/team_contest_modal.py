@@ -64,7 +64,7 @@ class TeamContestModal(discord.ui.Modal):
         )
         self.team_name = discord.ui.InputText(
             label="팀명",
-            placeholder="예시: 0x34_Main",
+            placeholder="예시: 0x34",
             min_length=1,
             max_length=100,
             required=True,
