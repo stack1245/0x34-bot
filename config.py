@@ -32,6 +32,8 @@ class Settings:
     schedule_channel_id: int | None
     tournament_channel_id: int | None
     recruitment_channel_id: int | None
+    gemini_api_key: str | None
+    gemini_model: str
     enable_server_events: bool
     sync_commands: bool
 
@@ -52,6 +54,8 @@ def load_settings() -> Settings:
         schedule_channel_id=_optional_int(os.getenv("SCHEDULE_CHANNEL_ID")),
         tournament_channel_id=_optional_int(os.getenv("TOURNAMENT_CHANNEL_ID")),
         recruitment_channel_id=_optional_int(os.getenv("RECRUITMENT_CHANNEL_ID")),
+        gemini_api_key=os.getenv("GEMINI_API_KEY", "").strip() or None,
+        gemini_model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
         enable_server_events=_env_flag("ENABLE_SERVER_EVENTS", True),
         sync_commands=_env_flag("SYNC_COMMANDS", True),
     )

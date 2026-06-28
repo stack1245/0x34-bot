@@ -41,9 +41,21 @@ python bot.py
 
 Railway는 `Procfile`의 `worker: python bot.py`를 사용해 봇을 실행합니다. SQLite 파일을 장기간 보관해야 한다면 Railway Volume을 만들고 `DATABASE_PATH`를 Volume 경로로 설정하세요. 운영 규모가 커지면 PostgreSQL로 교체하는 편이 안전합니다.
 
+## Gemini 설정
+
+`/모집생성`은 Google AI Studio에서 발급한 Gemini API 키가 필요합니다. 로컬 `.env` 또는 Railway Variables에 아래 값을 추가하세요.
+
+```env
+GEMINI_API_KEY=your-google-ai-studio-api-key
+GEMINI_MODEL=gemini-2.5-flash
+```
+
+API 키는 코드나 Git에 커밋하지 말고 환경 변수로만 관리하세요.
+
 ## 주요 명령어
 
 - `/일정`: 등록된 전체 일정을 Embed로 보여줍니다.
 - `/일정추가`: Modal로 제목, 날짜/시간, 내용을 받아 일정을 저장하고 서버 이벤트 생성을 시도합니다.
 - `/대회등록`: Modal로 대회 정보를 받아 알림 채널에 Embed를 전송합니다. 민감 정보 메모는 작성자에게만 Ephemeral 응답으로 보여줍니다.
 - `/모집`: Modal로 모집 글을 만들고 `[참가]`, `[불참]`, `[대기]`, `[모집 마감]` 버튼으로 실시간 참가자 목록을 관리합니다.
+- `/모집생성`: Gemini가 링크나 상세 텍스트를 분석해 모집 Embed를 만들고 동일한 참가 버튼을 붙입니다.
