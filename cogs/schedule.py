@@ -449,6 +449,10 @@ class ScheduleCog(commands.Cog):
                 logging.warning("Failed to resolve guild for schedule board %s: %s", guild_id, exc)
                 return None
 
+        for channel in getattr(guild, "text_channels", []):
+            if "일정" in channel.name:
+                return channel
+
         system_channel = getattr(guild, "system_channel", None)
         if isinstance(system_channel, discord.abc.Messageable):
             return system_channel
