@@ -25,6 +25,7 @@ from utils.embeds import SUCCESS_COLOR, WARNING_COLOR, base_embed
 
 MAX_SCHEDULE_SOURCE_TEXT_LENGTH = 12000
 SCRAPING_ERROR_MESSAGE = "웹페이지 내용을 불러오지 못했습니다. 사이트 링크 대신 상세 텍스트를 직접 입력해 주세요."
+SCHEDULE_BOARD_STATE_KEY = "schedule_board"
 
 
 SCHEDULE_GENERATION_PROMPT = """
@@ -117,14 +118,7 @@ class ScheduleModal(discord.ui.Modal, title="일정 추가"):
                 (event_id, cursor.lastrowid),
             )
 
-        notice_channel = await self.cog.resolve_schedule_channel(interaction)
-        if notice_channel is not None:
-            embed = base_embed("새 일정이 등록되었습니다", color=SUCCESS_COLOR)
-            embed.add_field(name="제목", value=str(self.title_input.value), inline=False)
-            embed.add_field(name="시간", value=format_discord_timestamp(starts_at), inline=True)
-            embed.add_field(name="등록자", value=interaction.user.mention, inline=True)
-            embed.add_field(name="내용", value=str(self.body_input.value)[:1024], inline=False)
-            await notice_channel.send(embed=embed)
+        await self.cog.update_schedule_board()
 
         await interaction.followup.send(
             f"일정이 등록되었습니다.\n- 시간: {format_discord_timestamp(starts_at)}\n- {event_status}",
@@ -179,6 +173,7 @@ class ScheduleDeleteSelect(discord.ui.Select):
         title = str(row["title"])
         event_notice = await self.cog.delete_linked_server_event(interaction.guild, row["event_id"])
         await self.cog.bot.database.execute("DELETE FROM schedules WHERE id = ?", (schedule_id,))
+        await self.cog.update_schedule_board()
 
         message = f"✅ {title} 일정이 성공적으로 삭제되었습니다."
         if event_notice:
@@ -283,6 +278,7 @@ class ScheduleEditModal(discord.ui.Modal, title="일정 수정"):
         )
 
         event_notice = await self.cog.edit_linked_server_event(interaction.guild, row["event_id"], title, starts_at, body)
+        await self.cog.update_schedule_board()
         await self.disable_source_view()
 
         message = "✅ 성공적으로 수정되었습니다."
@@ -395,6 +391,148 @@ class ScheduleCog(commands.Cog):
         if isinstance(channel, discord.abc.Messageable):
             return channel
         return None
+
+    async def fetch_schedule_board_state(self):
+        """DB에서 일정 대시보드 메시지 위치를 가져옵니다."""
+        return await self.bot.database.fetch_one(
+            """
+            SELECT board_channel_id, board_message_id FROM dashboard_state
+            WHERE name = ?
+            """,
+            (SCHEDULE_BOARD_STATE_KEY,),
+        )
+
+    async def save_schedule_board_state(self, channel_id: int, message_id: int) -> None:
+        """일정 대시보드 메시지 위치를 DB에 저장하거나 덮어씁니다."""
+        await self.bot.database.execute(
+            """
+            INSERT INTO dashboard_state (name, board_channel_id, board_message_id, updated_at)
+            VALUES (?, ?, ?, ?)
+            ON CONFLICT(name)
+            DO UPDATE SET
+                board_channel_id = excluded.board_channel_id,
+                board_message_id = excluded.board_message_id,
+                updated_at = excluded.updated_at
+            """,
+            (SCHEDULE_BOARD_STATE_KEY, channel_id, message_id, now_utc_iso()),
+        )
+
+    async def clear_schedule_board_state(self) -> None:
+        """삭제된 채널/메시지를 가리키는 일정 대시보드 상태를 제거합니다."""
+        await self.bot.database.execute(
+            "DELETE FROM dashboard_state WHERE name = ?",
+            (SCHEDULE_BOARD_STATE_KEY,),
+        )
+
+    async def resolve_schedule_board_channel(self, guild_id: int | None = None) -> discord.abc.Messageable | None:
+        """새 일정 대시보드를 만들 채널을 찾습니다."""
+        channel_id = self.bot.settings.schedule_channel_id
+        if channel_id is not None:
+            try:
+                channel = self.bot.get_channel(channel_id)
+                if channel is None:
+                    channel = await self.bot.fetch_channel(channel_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
+                logging.warning("Failed to resolve configured schedule board channel %s: %s", channel_id, exc)
+            else:
+                if isinstance(channel, discord.abc.Messageable):
+                    return channel
+
+        if guild_id is None:
+            return None
+
+        guild = self.bot.get_guild(int(guild_id))
+        if guild is None:
+            try:
+                guild = await self.bot.fetch_guild(int(guild_id))
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
+                logging.warning("Failed to resolve guild for schedule board %s: %s", guild_id, exc)
+                return None
+
+        system_channel = getattr(guild, "system_channel", None)
+        if isinstance(system_channel, discord.abc.Messageable):
+            return system_channel
+        return None
+
+    def build_schedule_board_embed(self, rows: list) -> discord.Embed:
+        """전체 일정을 하나의 대시보드 Embed description으로 조립합니다."""
+        if not rows:
+            return base_embed("Team 0x34 일정 대시보드", "등록된 일정이 없습니다.", color=WARNING_COLOR)
+
+        lines: list[str] = []
+        for row in rows:
+            starts_at = from_storage_iso(row["starts_at"], self.bot.settings.timezone)
+            start_ts = int(starts_at.timestamp())
+            body = str(row["body"]).strip()
+            line = f"• **{row['title']}**\n  <t:{start_ts}:F> (<t:{start_ts}:R>)"
+            if body:
+                line += f"\n  {body[:300]}"
+            if row["event_id"]:
+                line += f"\n  서버 이벤트 ID: `{row['event_id']}`"
+            lines.append(line)
+
+        description = "\n\n".join(lines)
+        if len(description) > 4000:
+            description = f"{description[:3997].rstrip()}..."
+
+        embed = base_embed("Team 0x34 일정 대시보드", description, color=SUCCESS_COLOR)
+        embed.set_footer(text="일정이 추가, 수정, 삭제될 때 자동으로 갱신됩니다.")
+        return embed
+
+    async def update_schedule_board(self) -> None:
+        """DB에 저장된 한 개의 일정 대시보드 메시지를 생성하거나 갱신합니다."""
+        rows = await self.bot.database.fetch_all(
+            """
+            SELECT * FROM schedules
+            ORDER BY starts_at ASC
+            """,
+        )
+        embed = self.build_schedule_board_embed(rows)
+        state = await self.fetch_schedule_board_state()
+
+        if state is not None and state["board_channel_id"] is not None and state["board_message_id"] is not None:
+            try:
+                channel_id = int(state["board_channel_id"])
+                message_id = int(state["board_message_id"])
+                channel = self.bot.get_channel(channel_id)
+                if channel is None:
+                    channel = await self.bot.fetch_channel(channel_id)
+                if not hasattr(channel, "fetch_message"):
+                    await self.clear_schedule_board_state()
+                else:
+                    message = await channel.fetch_message(message_id)
+                    await message.edit(embed=embed)
+                    return
+            except (TypeError, ValueError):
+                await self.clear_schedule_board_state()
+            except discord.NotFound:
+                await self.clear_schedule_board_state()
+            except discord.Forbidden as exc:
+                logging.warning("Missing permission to update schedule board: %s", exc)
+                return
+            except discord.HTTPException as exc:
+                logging.warning("Failed to update schedule board message: %s", exc)
+                return
+
+        guild_id = int(rows[0]["guild_id"]) if rows else None
+        channel = await self.resolve_schedule_board_channel(guild_id)
+        if channel is None:
+            logging.warning("Schedule board channel is not configured and no default channel was found.")
+            return
+
+        try:
+            message = await channel.send(embed=embed)
+        except discord.NotFound:
+            await self.clear_schedule_board_state()
+            return
+        except discord.Forbidden as exc:
+            logging.warning("Missing permission to create schedule board: %s", exc)
+            return
+        except discord.HTTPException as exc:
+            logging.warning("Failed to create schedule board message: %s", exc)
+            return
+
+        await self.save_schedule_board_state(message.channel.id, message.id)
 
     async def delete_linked_server_event(self, guild: discord.Guild, event_id) -> str | None:
         """DB 일정과 연결된 Discord 서버 이벤트가 있으면 함께 삭제합니다."""
@@ -685,6 +823,8 @@ class ScheduleCog(commands.Cog):
         if not registered:
             await interaction.followup.send("Gemini 응답에서 등록 가능한 일정을 찾지 못했습니다.", ephemeral=True)
             return
+
+        await self.update_schedule_board()
 
         summary_lines: list[str] = []
         for title, starts_at, ends_at in registered:

@@ -58,6 +58,14 @@ SCHEMA: tuple[str, ...] = (
         FOREIGN KEY (recruitment_id) REFERENCES recruitments(id) ON DELETE CASCADE
     )
     """,
+    """
+    CREATE TABLE IF NOT EXISTS dashboard_state (
+        name TEXT PRIMARY KEY,
+        board_channel_id INTEGER,
+        board_message_id INTEGER,
+        updated_at TEXT NOT NULL
+    )
+    """,
 )
 
 
