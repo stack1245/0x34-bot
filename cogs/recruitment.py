@@ -4,6 +4,7 @@ import asyncio
 import json
 import logging
 import re
+from datetime import datetime, timedelta
 
 import aiohttp
 import discord
@@ -12,7 +13,7 @@ from discord.ext import commands
 import google.generativeai as genai
 from bs4 import BeautifulSoup
 
-from utils.datetime import now_utc_iso
+from utils.datetime import format_discord_timestamp, now_utc_iso, parse_datetime, to_storage_iso
 from utils.embeds import STOP_COLOR, SUCCESS_COLOR, WARNING_COLOR, base_embed, mention_list
 
 
@@ -27,6 +28,17 @@ MAX_EMBED_DESCRIPTION_LENGTH = 3900
 MAX_SCRAPED_TEXT_LENGTH = 5000
 MAX_RECRUITMENT_SOURCE_TEXT_LENGTH = 12000
 SCRAPING_ERROR_MESSAGE = "웹페이지 내용을 불러오지 못했습니다. 사이트 링크 대신 상세 텍스트를 직접 입력해 주세요."
+SCHEDULE_EXTRACTION_ERROR_MESSAGE = "일정 날짜를 자동 추출하지 못했습니다. 수동으로 등록해 주세요."
+SCHEDULE_EXTRACTION_MODEL = "gemini-1.5-flash"
+SCHEDULE_EXTRACTION_PROMPT = """
+주어진 모집글 텍스트에서 해커톤/대회 일정을 분석하여 다음 JSON 스키마로만 응답해라.
+{
+    "start_time": "YYYY-MM-DD HH:MM:SS 형식의 시작 시간",
+    "end_time": "YYYY-MM-DD HH:MM:SS 형식의 종료 시간 (없으면 시작 시간과 동일하게)",
+    "location": "온라인 또는 오프라인 장소"
+}
+날짜나 시간이 명확하지 않으면 추측하지 말고 빈 JSON 객체 {}를 반환해라.
+""".strip()
 URL_PATTERN = re.compile(r"https?://[^\s<>()]+", re.IGNORECASE)
 URL_TRAILING_PUNCTUATION = ".,;:!?)]}>'\""
 
@@ -45,6 +57,10 @@ GEMINI_SYSTEM_PROMPT = """
 
 class ScrapingError(RuntimeError):
     """URL 크롤링 실패를 `/모집생성`에서 사용자 안내로 바꾸기 위한 예외입니다."""
+
+
+class ScheduleExtractionError(RuntimeError):
+    """Gemini 날짜 추출 실패를 마감 버튼 안내로 바꾸기 위한 예외입니다."""
 
 
 def _trim_text(value: str, limit: int) -> str:
@@ -223,6 +239,32 @@ def parse_gemini_recruitment(raw_text: str, fallback_source: str) -> tuple[str, 
     return title, _trim_text(description, MAX_EMBED_DESCRIPTION_LENGTH), max_members
 
 
+def parse_gemini_schedule_payload(raw_text: str, timezone_name: str) -> tuple[datetime, datetime, str]:
+    """Gemini가 반환한 일정 JSON을 datetime과 장소 문자열로 변환합니다."""
+    cleaned = _strip_json_code_fence(raw_text)
+    try:
+        payload = json.loads(cleaned)
+    except json.JSONDecodeError as exc:
+        raise ScheduleExtractionError("Gemini schedule response is not valid JSON") from exc
+
+    if not isinstance(payload, dict):
+        raise ScheduleExtractionError("Gemini schedule response is not a JSON object")
+
+    start_time = str(payload.get("start_time", "")).strip()
+    end_time = str(payload.get("end_time", "")).strip() or start_time
+    location = str(payload.get("location", "온라인")).strip() or "온라인"
+    if not start_time:
+        raise ScheduleExtractionError("start_time is missing")
+
+    try:
+        starts_at = parse_datetime(start_time, timezone_name)
+        ends_at = parse_datetime(end_time, timezone_name)
+    except ValueError as exc:
+        raise ScheduleExtractionError("invalid schedule datetime format") from exc
+
+    return starts_at, ends_at, location
+
+
 class RecruitmentView(discord.ui.View):
     """모집 메시지 아래에 붙는 Persistent Button View입니다."""
 
@@ -289,22 +331,27 @@ class RecruitmentView(discord.ui.View):
     @discord.ui.button(label="모집 마감", style=discord.ButtonStyle.primary, custom_id="0x34:recruitment:close")
     async def close_recruitment(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
         """작성자가 모집을 마감하고 참가자 멘션 및 스레드 생성을 시도합니다."""
+        await interaction.response.defer(ephemeral=False)
+
         if interaction.message is None:
-            await interaction.response.send_message("모집 메시지를 찾을 수 없습니다.", ephemeral=True)
+            await interaction.followup.send("모집 메시지를 찾을 수 없습니다.", ephemeral=True)
             return
 
         recruitment = await self.cog.get_recruitment(interaction.message.id)
         if recruitment is None:
-            await interaction.response.send_message("DB에서 모집 정보를 찾을 수 없습니다.", ephemeral=True)
+            await interaction.followup.send("DB에서 모집 정보를 찾을 수 없습니다.", ephemeral=True)
             return
         if interaction.user.id != recruitment["author_id"]:
-            await interaction.response.send_message("모집 작성자만 마감할 수 있습니다.", ephemeral=True)
+            await interaction.followup.send("모집 작성자만 마감할 수 있습니다.", ephemeral=True)
             return
         if recruitment["status"] == STATUS_CLOSED:
-            await interaction.response.send_message("이미 마감된 모집입니다.", ephemeral=True)
+            await interaction.followup.send("이미 마감된 모집입니다.", ephemeral=True)
             return
 
-        await interaction.response.defer(ephemeral=True, thinking=True)
+        source_embed = interaction.message.embeds[0] if interaction.message.embeds else None
+        source_title = source_embed.title if source_embed and source_embed.title else str(recruitment["title"])
+        source_description = source_embed.description if source_embed and source_embed.description else str(recruitment["target"])
+
         await self.cog.bot.database.execute(
             "UPDATE recruitments SET status = ?, closed_at = ? WHERE id = ?",
             (STATUS_CLOSED, now_utc_iso(), recruitment["id"]),
@@ -317,10 +364,23 @@ class RecruitmentView(discord.ui.View):
         joined = await self.cog.get_vote_user_ids(recruitment["id"], STATE_JOIN)
         mentions = " ".join(f"<@{user_id}>" for user_id in joined) or "참가자가 없습니다."
 
+        schedule_registered = False
+        schedule_notice = SCHEDULE_EXTRACTION_ERROR_MESSAGE
+        try:
+            schedule_registered, schedule_notice = await self.cog.register_schedule_from_closed_recruitment(
+                interaction,
+                title=source_title,
+                description=source_description,
+                participant_user_ids=joined,
+                source_message=interaction.message,
+            )
+        except Exception:
+            logging.exception("Failed to auto-register schedule from recruitment %s", recruitment["id"])
+
         if thread is None:
             await interaction.followup.send(
                 "모집은 마감했지만 비공개 스레드를 사용할 수 없어 참가자 멘션은 공개 채널에 보내지 않았습니다.\n"
-                f"{thread_notice or '채널 권한과 서버 부스트 레벨을 확인해 주세요.'}",
+                f"{thread_notice or '채널 권한과 서버 부스트 레벨을 확인해 주세요.'}\n{schedule_notice}",
                 ephemeral=True,
             )
             return
@@ -328,8 +388,17 @@ class RecruitmentView(discord.ui.View):
         for user_id in joined:
             await self.cog.add_user_to_private_thread(thread, discord.Object(id=user_id))
 
-        await thread.send(f"모집이 마감되었습니다.\n참가 인원: {mentions}")
-        await interaction.followup.send(f"모집을 마감하고 비공개 워크스페이스에 참가자를 안내했습니다: {thread.mention}", ephemeral=True)
+        if schedule_registered:
+            await thread.send(
+                f"{mentions}\n모집이 마감되었으며, 대회 일정이 서버 캘린더/일정 채널에 자동 등록되었습니다!"
+            )
+        else:
+            await thread.send(f"{mentions}\n모집이 마감되었습니다. {SCHEDULE_EXTRACTION_ERROR_MESSAGE}")
+
+        await interaction.followup.send(
+            f"모집을 마감하고 비공개 워크스페이스에 참가자를 안내했습니다: {thread.mention}\n{schedule_notice}",
+            ephemeral=True,
+        )
 
 
 class RecruitmentModal(discord.ui.Modal, title="팀원 모집"):
@@ -397,6 +466,146 @@ class RecruitmentCog(commands.Cog):
         if interaction.channel is None or not isinstance(interaction.channel, discord.abc.Messageable):
             raise RuntimeError("모집 글을 보낼 채널을 찾을 수 없습니다.")
         return interaction.channel
+
+    async def resolve_schedule_channel(self, interaction: discord.Interaction) -> discord.abc.Messageable | None:
+        """SCHEDULE_CHANNEL_ID가 설정되어 있으면 일정 자동 등록 공지를 보낼 채널을 찾습니다."""
+        channel_id = self.bot.settings.schedule_channel_id
+        if interaction.guild is None or channel_id is None:
+            return None
+
+        channel = interaction.guild.get_channel(channel_id)
+        if channel is None:
+            try:
+                channel = await self.bot.fetch_channel(channel_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+                return None
+        if isinstance(channel, discord.abc.Messageable):
+            return channel
+        return None
+
+    def _extract_schedule_payload_sync(self, source_text: str) -> str:
+        """Gemini 동기 API로 모집글에서 시작/종료 시간과 장소 JSON을 추출합니다."""
+        if self.bot.settings.gemini_api_key is None:
+            raise ScheduleExtractionError("GEMINI_API_KEY is missing")
+
+        genai.configure(api_key=self.bot.settings.gemini_api_key)
+        model = genai.GenerativeModel(
+            model_name=SCHEDULE_EXTRACTION_MODEL,
+            system_instruction=SCHEDULE_EXTRACTION_PROMPT,
+        )
+        response = model.generate_content(
+            f"모집글 제목과 본문:\n\n{source_text}",
+            generation_config={
+                "temperature": 0.1,
+                "response_mime_type": "application/json",
+            },
+        )
+        return str(getattr(response, "text", "") or "")
+
+    async def extract_schedule_from_recruitment_text(self, title: str, description: str) -> tuple[datetime, datetime, str]:
+        """Embed 제목/본문을 Gemini에 보내 일정 정보를 datetime으로 파싱합니다."""
+        source_text = f"제목: {title}\n\n본문:\n{description}"
+        raw_text = await asyncio.to_thread(self._extract_schedule_payload_sync, source_text)
+        return parse_gemini_schedule_payload(raw_text, self.bot.settings.timezone)
+
+    async def create_recruitment_scheduled_event(
+        self,
+        interaction: discord.Interaction,
+        title: str,
+        starts_at: datetime,
+        ends_at: datetime,
+        location: str,
+        body: str,
+    ) -> int | None:
+        """설정이 켜져 있으면 Discord 서버 이벤트도 함께 생성합니다."""
+        if interaction.guild is None or not self.bot.settings.enable_server_events:
+            return None
+
+        event_end = ends_at if ends_at > starts_at else starts_at + timedelta(hours=1)
+
+        try:
+            event = await interaction.guild.create_scheduled_event(
+                name=title[:100],
+                start_time=starts_at,
+                end_time=event_end,
+                description=body[:1000],
+                entity_type=discord.EntityType.external,
+                privacy_level=discord.PrivacyLevel.guild_only,
+                location=location[:100] or "온라인",
+                reason="Team 0x34 모집 마감 일정 자동 등록",
+            )
+        except (discord.Forbidden, discord.HTTPException):
+            return None
+        return event.id
+
+    async def register_schedule_from_closed_recruitment(
+        self,
+        interaction: discord.Interaction,
+        *,
+        title: str,
+        description: str,
+        participant_user_ids: list[int],
+        source_message: discord.Message,
+    ) -> tuple[bool, str]:
+        """모집 Embed 내용을 Gemini로 분석해 schedules 테이블과 일정 채널에 자동 등록합니다."""
+        starts_at, ends_at, location = await self.extract_schedule_from_recruitment_text(title, description)
+        participant_mentions = " ".join(f"<@{user_id}>" for user_id in participant_user_ids) or "참가 확정 인원 없음"
+        body = (
+            "모집 마감으로 자동 등록된 일정입니다.\n"
+            f"기간: {format_discord_timestamp(starts_at)} ~ {format_discord_timestamp(ends_at)}\n"
+            f"장소: {location}\n"
+            f"참가 확정: {participant_mentions}\n"
+            f"모집 글: {source_message.jump_url}"
+        )
+
+        event_id = await self.create_recruitment_scheduled_event(
+            interaction,
+            title,
+            starts_at,
+            ends_at,
+            location,
+            body,
+        )
+        await self.bot.database.execute(
+            """
+            INSERT INTO schedules (guild_id, title, starts_at, body, created_by, created_at, event_id)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                interaction.guild.id if interaction.guild else 0,
+                title,
+                to_storage_iso(starts_at),
+                body,
+                interaction.user.id,
+                now_utc_iso(),
+                event_id,
+            ),
+        )
+
+        schedule_channel = await self.resolve_schedule_channel(interaction)
+        if schedule_channel is not None:
+            embed = base_embed("일정 자동 등록", "모집이 마감되어 일정이 등록되었습니다.", color=SUCCESS_COLOR)
+            embed.add_field(name="제목", value=title[:1024], inline=False)
+            embed.add_field(name="시작", value=format_discord_timestamp(starts_at), inline=True)
+            embed.add_field(name="종료", value=format_discord_timestamp(ends_at), inline=True)
+            embed.add_field(name="장소", value=location[:1024], inline=False)
+            embed.add_field(name="참가 확정", value=participant_mentions[:1024], inline=False)
+            if event_id is not None:
+                embed.add_field(name="서버 이벤트 ID", value=f"`{event_id}`", inline=True)
+            try:
+                await schedule_channel.send(
+                    content="🎉 [일정 자동 등록] 모집이 마감되어 일정이 등록되었습니다.",
+                    embed=embed,
+                )
+            except discord.HTTPException:
+                logging.exception("Failed to send recruitment schedule notice")
+
+        notice = f"일정이 자동 등록되었습니다: {format_discord_timestamp(starts_at)}"
+        if schedule_channel is not None:
+            notice += f" ({schedule_channel.mention})"
+        if event_id is not None:
+            notice += " / 서버 이벤트 생성 완료"
+        return True, notice
 
     async def post_recruitment_message(
         self,
