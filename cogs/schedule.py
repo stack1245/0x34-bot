@@ -10,6 +10,7 @@ from discord import app_commands
 from discord.ext import commands
 import google.generativeai as genai
 
+from utils.ai_input import CONVERSATIONAL_INPUT_INSTRUCTION, ScrapingError, prepare_conversational_source_text
 from utils.datetime import (
     fix_past_year,
     format_discord_timestamp,
@@ -20,6 +21,10 @@ from utils.datetime import (
     to_storage_iso,
 )
 from utils.embeds import SUCCESS_COLOR, WARNING_COLOR, base_embed
+
+
+MAX_SCHEDULE_SOURCE_TEXT_LENGTH = 12000
+SCRAPING_ERROR_MESSAGE = "웹페이지 내용을 불러오지 못했습니다. 사이트 링크 대신 상세 텍스트를 직접 입력해 주세요."
 
 
 SCHEDULE_GENERATION_PROMPT = """
@@ -45,6 +50,7 @@ def build_schedule_generation_prompt() -> str:
     return f"""
 {get_current_time_context()}
 위 제공된 '현재 시간'을 기준으로 날짜를 계산해라. 본문에 연도가 생략되어 있다면 무조건 현재 연도를 사용하고, 절대로 지나간 과거 연도로 작성하지 마라.
+{CONVERSATIONAL_INPUT_INSTRUCTION}
 
 {SCHEDULE_GENERATION_PROMPT}
 """.strip()
@@ -463,7 +469,8 @@ class ScheduleCog(commands.Cog):
             system_instruction=build_schedule_generation_prompt(),
         )
         response = model.generate_content(
-            "다음 대회/행사 안내 텍스트에서 등록할 수 있는 모든 일정을 JSON 배열로 추출해 주세요.\n\n"
+            "다음은 사용자가 자유롭게 제공한 대화형 입력과 URL 크롤링 내용을 합친 원문입니다. "
+            "사용자의 요청 의도와 어조를 유지하면서 등록할 수 있는 모든 일정을 JSON 배열로 추출해 주세요.\n\n"
             f"{source_text}",
             generation_config={
                 "temperature": 0.2,
@@ -476,6 +483,14 @@ class ScheduleCog(commands.Cog):
         """Gemini 호출을 이벤트 루프 밖 스레드로 넘기고 JSON 배열을 파싱합니다."""
         raw_text = await asyncio.to_thread(self.generate_schedule_json_sync, source_text)
         return self.parse_generated_schedules(raw_text)
+
+    async def prepare_schedule_source_text(self, target_info: str) -> str:
+        """구어체 입력 원문과 URL 크롤링 결과를 일정 생성용 Gemini 입력으로 합칩니다."""
+        return await prepare_conversational_source_text(
+            target_info,
+            max_length=MAX_SCHEDULE_SOURCE_TEXT_LENGTH,
+            logger=logging.getLogger(__name__),
+        )
 
     async def insert_generated_schedule(
         self,
@@ -641,13 +656,17 @@ class ScheduleCog(commands.Cog):
             await interaction.followup.send("서버 안에서만 일정을 생성할 수 있습니다.", ephemeral=True)
             return
 
-        source_text = target_info.strip()
-        if not source_text:
+        target_info = target_info.strip()
+        if not target_info:
             await interaction.followup.send("일정을 추출할 텍스트를 입력해 주세요.", ephemeral=True)
             return
 
         try:
+            source_text = await self.prepare_schedule_source_text(target_info)
             items = await self.generate_schedule_items(source_text)
+        except ScrapingError:
+            await interaction.followup.send(SCRAPING_ERROR_MESSAGE, ephemeral=True)
+            return
         except RuntimeError as exc:
             await interaction.followup.send(str(exc), ephemeral=True)
             return

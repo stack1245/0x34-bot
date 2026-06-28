@@ -5,13 +5,17 @@ import json
 import logging
 import re
 
-import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
 import google.generativeai as genai
-from bs4 import BeautifulSoup
 
+from utils.ai_input import (
+    CONVERSATIONAL_INPUT_INSTRUCTION,
+    ScrapingError,
+    prepare_conversational_source_text,
+    trim_text as _trim_text,
+)
 from utils.datetime import get_current_time_context, now_utc_iso
 from utils.embeds import STOP_COLOR, SUCCESS_COLOR, WARNING_COLOR, base_embed, mention_list
 
@@ -24,11 +28,8 @@ STATUS_CLOSED = "closed"
 DEFAULT_AI_RECRUITMENT_CAPACITY = 4
 MAX_AI_TITLE_LENGTH = 50
 MAX_EMBED_DESCRIPTION_LENGTH = 3900
-MAX_SCRAPED_TEXT_LENGTH = 5000
 MAX_RECRUITMENT_SOURCE_TEXT_LENGTH = 12000
 SCRAPING_ERROR_MESSAGE = "웹페이지 내용을 불러오지 못했습니다. 사이트 링크 대신 상세 텍스트를 직접 입력해 주세요."
-URL_PATTERN = re.compile(r"https?://[^\s<>()]+", re.IGNORECASE)
-URL_TRAILING_PUNCTUATION = ".,;:!?)]}>'\""
 
 
 GEMINI_SYSTEM_PROMPT = """
@@ -48,108 +49,10 @@ def build_recruitment_system_prompt() -> str:
     return f"""
 {get_current_time_context()}
 위 제공된 '현재 시간'을 기준으로 날짜를 계산해라. 본문에 연도가 생략되어 있다면 무조건 현재 연도를 사용하고, 절대로 지나간 과거 연도로 작성하지 마라.
+{CONVERSATIONAL_INPUT_INSTRUCTION}
 
 {GEMINI_SYSTEM_PROMPT}
 """.strip()
-
-
-class ScrapingError(RuntimeError):
-    """URL 크롤링 실패를 `/모집생성`에서 사용자 안내로 바꾸기 위한 예외입니다."""
-
-
-def _trim_text(value: str, limit: int) -> str:
-    """Discord Embed 제한을 넘지 않도록 긴 문자열을 안전하게 자릅니다."""
-    text = value.strip()
-    if len(text) <= limit:
-        return text
-    return f"{text[: limit - 3].rstrip()}..."
-
-
-def is_url(value: str) -> bool:
-    """target_info가 http/https URL인지 정규식으로 확인합니다."""
-    return URL_PATTERN.fullmatch(value.strip()) is not None
-
-
-def extract_urls(value: str) -> list[str]:
-    """target_info 안에 섞여 있는 모든 URL을 입력 순서대로 추출합니다."""
-    urls: list[str] = []
-    for match in re.findall(URL_PATTERN, value):
-        url = match.rstrip(URL_TRAILING_PUNCTUATION)
-        if url and url not in urls:
-            urls.append(url)
-    return urls
-
-
-def remove_urls_for_plain_text(value: str, urls: list[str]) -> str:
-    """모든 URL을 뺀 나머지 사용자 텍스트가 있는지 확인합니다."""
-    text = value
-    for url in urls:
-        text = text.replace(url, " ")
-    return re.sub(r"[\s.,;:!?()[\]{}'\"<>]+", " ", text).strip()
-
-
-def replace_urls_with_scraped_text(value: str, scraped_by_url: dict[str, str], failed_urls: set[str]) -> str:
-    """입력 문장 안의 URL 위치를 크롤링한 텍스트 또는 실패 안내로 치환합니다."""
-    pieces: list[str] = []
-    cursor = 0
-
-    for match in URL_PATTERN.finditer(value):
-        raw_url = match.group(0)
-        url = raw_url.rstrip(URL_TRAILING_PUNCTUATION)
-        start = match.start()
-        end = start + len(url)
-
-        pieces.append(value[cursor:start])
-        if url in scraped_by_url:
-            pieces.append(f"\n\n[크롤링한 URL: {url}]\n{scraped_by_url[url]}\n\n")
-        elif url in failed_urls:
-            pieces.append(f"\n\n[크롤링 실패 URL: {url}]\n웹페이지 내용을 불러오지 못했습니다.\n\n")
-        else:
-            pieces.append(url)
-        cursor = end
-
-    pieces.append(value[cursor:])
-    merged_text = "".join(pieces)
-    merged_text = re.sub(r"[ \t\r\f\v]+", " ", merged_text)
-    merged_text = re.sub(r"\n{3,}", "\n\n", merged_text).strip()
-    return _trim_text(merged_text, MAX_RECRUITMENT_SOURCE_TEXT_LENGTH)
-
-
-def normalize_scraped_text(value: str) -> str:
-    """HTML에서 추출한 텍스트의 반복 공백과 줄바꿈을 줄여 토큰 낭비를 막습니다."""
-    text = re.sub(r"\s+", " ", value).strip()
-    return _trim_text(text, MAX_SCRAPED_TEXT_LENGTH)
-
-
-async def extract_text_from_url(url: str) -> str:
-    """aiohttp와 BeautifulSoup으로 웹페이지의 본문 텍스트만 추출합니다.
-
-    Gemini는 URL을 직접 읽는 브라우저가 아니므로, 링크만 넘기면 모델이 내용을 추측할 수 있습니다.
-    이 함수는 봇이 먼저 HTML을 가져오고, script/style 태그를 제거한 순수 텍스트만 Gemini 프롬프트에 넣습니다.
-    """
-    timeout = aiohttp.ClientTimeout(total=10)
-    headers = {
-        "User-Agent": "Team0x34Bot/1.0 (+https://discord.com)",
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-    }
-
-    try:
-        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
-            async with session.get(url, allow_redirects=True) as response:
-                if response.status >= 400:
-                    raise ScrapingError(f"HTTP {response.status}")
-                html = await response.text(errors="ignore")
-    except (aiohttp.ClientError, TimeoutError, asyncio.TimeoutError) as exc:
-        raise ScrapingError(str(exc)) from exc
-
-    soup = BeautifulSoup(html, "html.parser")
-    for tag in soup(["script", "style"]):
-        tag.decompose()
-
-    scraped_text = normalize_scraped_text(soup.get_text(separator=" "))
-    if not scraped_text:
-        raise ScrapingError("empty page text")
-    return scraped_text
 
 
 def _strip_json_code_fence(value: str) -> str:
@@ -773,7 +676,8 @@ class RecruitmentCog(commands.Cog):
             system_instruction=build_recruitment_system_prompt(),
         )
         response = model.generate_content(
-            "다음은 해커톤/대회 웹사이트에서 추출한 실제 텍스트 내용입니다: "
+            "다음은 사용자가 자유롭게 제공한 대화형 입력과 URL 크롤링 내용을 합친 원문입니다. "
+            "사용자의 요청 의도와 어조를 유지하면서 모집글을 작성해라: "
             f"\n\n{source_text}\n\n"
             "이 텍스트 내용만을 엄격하게 바탕으로, 없는 내용을 지어내지 말고 다음 규칙에 따라 모집글을 작성해라.",
             generation_config={
@@ -790,34 +694,11 @@ class RecruitmentCog(commands.Cog):
 
     async def prepare_recruitment_source_text(self, target_info: str) -> str:
         """입력 텍스트에 포함된 여러 URL을 동시에 크롤링하고 일반 텍스트와 병합합니다."""
-        urls = extract_urls(target_info)
-        if not urls:
-            return _trim_text(target_info, MAX_RECRUITMENT_SOURCE_TEXT_LENGTH)
-
-        # URL이 여러 개일 때 `for url in urls: await ...`처럼 순차 처리하면
-        # 첫 번째 사이트가 느린 동안 뒤 URL들은 시작조차 하지 못합니다.
-        # asyncio.gather는 모든 extract_text_from_url 코루틴을 동시에 스케줄링하므로
-        # 전체 대기 시간이 URL 개수의 합이 아니라 가장 느린 요청 시간에 가깝게 줄어듭니다.
-        # return_exceptions=True를 주면 일부 URL이 403/타임아웃으로 실패해도 gather 전체가 취소되지 않고,
-        # 아래에서 성공한 결과만 골라 Gemini 프롬프트에 사용할 수 있습니다.
-        scraping_results = await asyncio.gather(
-            *(extract_text_from_url(url) for url in urls),
-            return_exceptions=True,
+        return await prepare_conversational_source_text(
+            target_info,
+            max_length=MAX_RECRUITMENT_SOURCE_TEXT_LENGTH,
+            logger=logging.getLogger(__name__),
         )
-
-        scraped_by_url: dict[str, str] = {}
-        failed_urls: set[str] = set()
-        for url, result in zip(urls, scraping_results):
-            if isinstance(result, Exception):
-                failed_urls.add(url)
-                logging.info("Failed to scrape recruitment URL %s: %s", url, result)
-                continue
-            scraped_by_url[url] = result
-
-        if not scraped_by_url and not remove_urls_for_plain_text(target_info, urls):
-            raise ScrapingError("all URLs failed")
-
-        return replace_urls_with_scraped_text(target_info, scraped_by_url, failed_urls)
 
     async def get_recruitment(self, message_id: int):
         """메시지 ID로 모집 레코드를 찾습니다."""
