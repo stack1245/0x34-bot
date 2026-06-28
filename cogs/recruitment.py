@@ -12,7 +12,7 @@ from discord.ext import commands
 import google.generativeai as genai
 from bs4 import BeautifulSoup
 
-from utils.datetime import now_utc_iso
+from utils.datetime import get_current_time_context, now_utc_iso
 from utils.embeds import STOP_COLOR, SUCCESS_COLOR, WARNING_COLOR, base_embed, mention_list
 
 
@@ -40,6 +40,16 @@ GEMINI_SYSTEM_PROMPT = """
 }
 텍스트에 없는 내용은 추측하지 말고, 확인할 수 없는 항목은 "공개된 정보 없음"이라고 적어라.
 응답은 반드시 JSON 객체 하나로만 작성해라.
+""".strip()
+
+
+def build_recruitment_system_prompt() -> str:
+    """Gemini 모집 글 생성에 현재 한국 시간과 날짜 규칙을 주입합니다."""
+    return f"""
+{get_current_time_context()}
+위 제공된 '현재 시간'을 기준으로 날짜를 계산해라. 본문에 연도가 생략되어 있다면 무조건 현재 연도를 사용하고, 절대로 지나간 과거 연도로 작성하지 마라.
+
+{GEMINI_SYSTEM_PROMPT}
 """.strip()
 
 
@@ -760,7 +770,7 @@ class RecruitmentCog(commands.Cog):
         genai.configure(api_key=self.bot.settings.gemini_api_key)
         model = genai.GenerativeModel(
             model_name=self.bot.settings.gemini_model,
-            system_instruction=GEMINI_SYSTEM_PROMPT,
+            system_instruction=build_recruitment_system_prompt(),
         )
         response = model.generate_content(
             "다음은 해커톤/대회 웹사이트에서 추출한 실제 텍스트 내용입니다: "

@@ -10,7 +10,15 @@ from discord import app_commands
 from discord.ext import commands
 import google.generativeai as genai
 
-from utils.datetime import format_discord_timestamp, from_storage_iso, now_utc_iso, parse_datetime, to_storage_iso
+from utils.datetime import (
+    fix_past_year,
+    format_discord_timestamp,
+    from_storage_iso,
+    get_current_time_context,
+    now_utc_iso,
+    parse_datetime,
+    to_storage_iso,
+)
 from utils.embeds import SUCCESS_COLOR, WARNING_COLOR, base_embed
 
 
@@ -29,6 +37,16 @@ SCHEDULE_GENERATION_PROMPT = """
 ]
 텍스트에 명시되지 않은 일정은 추측하지 말고 제외해라.
 날짜가 불완전해서 YYYY-MM-DD HH:MM:SS 형식으로 확정할 수 없는 항목도 제외해라.
+""".strip()
+
+
+def build_schedule_generation_prompt() -> str:
+    """Gemini 일정 생성에 현재 한국 시간과 날짜 규칙을 주입합니다."""
+    return f"""
+{get_current_time_context()}
+위 제공된 '현재 시간'을 기준으로 날짜를 계산해라. 본문에 연도가 생략되어 있다면 무조건 현재 연도를 사용하고, 절대로 지나간 과거 연도로 작성하지 마라.
+
+{SCHEDULE_GENERATION_PROMPT}
 """.strip()
 
 
@@ -442,7 +460,7 @@ class ScheduleCog(commands.Cog):
         genai.configure(api_key=self.bot.settings.gemini_api_key)
         model = genai.GenerativeModel(
             model_name=self.bot.settings.gemini_model,
-            system_instruction=SCHEDULE_GENERATION_PROMPT,
+            system_instruction=build_schedule_generation_prompt(),
         )
         response = model.generate_content(
             "다음 대회/행사 안내 텍스트에서 등록할 수 있는 모든 일정을 JSON 배열로 추출해 주세요.\n\n"
@@ -477,8 +495,8 @@ class ScheduleCog(commands.Cog):
             if not title or not start_time_text or not end_time_text or not description:
                 return None
 
-            starts_at = parse_datetime(start_time_text, self.bot.settings.timezone)
-            ends_at = parse_datetime(end_time_text, self.bot.settings.timezone)
+            starts_at = fix_past_year(parse_datetime(start_time_text, self.bot.settings.timezone))
+            ends_at = fix_past_year(parse_datetime(end_time_text, self.bot.settings.timezone))
         except (KeyError, TypeError, ValueError) as exc:
             logging.info("Skipping invalid generated schedule item %s: %s", item, exc)
             return None

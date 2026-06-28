@@ -14,6 +14,24 @@ INPUT_FORMATS: tuple[str, ...] = (
 )
 
 
+def get_current_time_context() -> str:
+    """Gemini 프롬프트에 넣을 현재 한국 시간 문장을 만듭니다."""
+    current = datetime.now(ZoneInfo("Asia/Seoul"))
+    return current.strftime("현재 한국 시간은 %Y년 %m월 %d일 %H시 %M분입니다.")
+
+
+def fix_past_year(date_obj: datetime) -> datetime:
+    """AI가 과거 연도를 반환했을 때 현재 한국 연도로 보정합니다."""
+    current_year = datetime.now(ZoneInfo("Asia/Seoul")).year
+    if date_obj.year >= current_year:
+        return date_obj
+
+    try:
+        return date_obj.replace(year=current_year)
+    except ValueError:
+        return date_obj.replace(year=current_year, day=28)
+
+
 def parse_datetime(value: str, timezone_name: str) -> datetime:
     """사용자가 입력한 날짜/시간 문자열을 timezone이 있는 datetime으로 변환합니다."""
     text = value.strip()
