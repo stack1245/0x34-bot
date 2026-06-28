@@ -5,10 +5,12 @@ import json
 import logging
 import re
 
+import aiohttp
 import discord
 from discord import app_commands
 from discord.ext import commands
 import google.generativeai as genai
+from bs4 import BeautifulSoup
 
 from utils.datetime import now_utc_iso
 from utils.embeds import STOP_COLOR, SUCCESS_COLOR, WARNING_COLOR, base_embed, mention_list
@@ -22,14 +24,21 @@ STATUS_CLOSED = "closed"
 DEFAULT_AI_RECRUITMENT_CAPACITY = 4
 MAX_AI_TITLE_LENGTH = 50
 MAX_EMBED_DESCRIPTION_LENGTH = 3900
+MAX_SCRAPED_TEXT_LENGTH = 5000
+SCRAPING_ERROR_MESSAGE = "웹페이지 내용을 불러오지 못했습니다. 사이트 링크 대신 상세 텍스트를 직접 입력해 주세요."
+URL_PATTERN = re.compile(r"^https?://[^\s<>()]+$", re.IGNORECASE)
 
 
 GEMINI_SYSTEM_PROMPT = """
-제공된 링크나 텍스트를 분석하여 해커톤/대회 모집 글을 작성해라.
 1. 제목은 이모지를 포함해 50자 이내로 직관적으로 작성해라.
 2. 본문은 대회 일정, 참가 자격, 주제, 혜택을 디스코드 마크다운(볼드, 불릿 등)을 활용해 깔끔하게 요약해라.
-3. 응답은 반드시 JSON 객체 하나로만 작성해라. 형식은 {"title": "제목", "description": "본문"} 이다.
+3. 텍스트에 없는 내용은 추측하지 말고, 확인할 수 없는 항목은 "공개된 정보 없음"이라고 적어라.
+4. 응답은 반드시 JSON 객체 하나로만 작성해라. 형식은 {"title": "제목", "description": "본문"} 이다.
 """.strip()
+
+
+class ScrapingError(RuntimeError):
+    """URL 크롤링 실패를 `/모집생성`에서 사용자 안내로 바꾸기 위한 예외입니다."""
 
 
 def _trim_text(value: str, limit: int) -> str:
@@ -38,6 +47,48 @@ def _trim_text(value: str, limit: int) -> str:
     if len(text) <= limit:
         return text
     return f"{text[: limit - 3].rstrip()}..."
+
+
+def is_url(value: str) -> bool:
+    """target_info가 http/https URL인지 정규식으로 확인합니다."""
+    return URL_PATTERN.fullmatch(value.strip()) is not None
+
+
+def normalize_scraped_text(value: str) -> str:
+    """HTML에서 추출한 텍스트의 반복 공백과 줄바꿈을 줄여 토큰 낭비를 막습니다."""
+    text = re.sub(r"\s+", " ", value).strip()
+    return _trim_text(text, MAX_SCRAPED_TEXT_LENGTH)
+
+
+async def extract_text_from_url(url: str) -> str:
+    """aiohttp와 BeautifulSoup으로 웹페이지의 본문 텍스트만 추출합니다.
+
+    Gemini는 URL을 직접 읽는 브라우저가 아니므로, 링크만 넘기면 모델이 내용을 추측할 수 있습니다.
+    이 함수는 봇이 먼저 HTML을 가져오고, script/style 태그를 제거한 순수 텍스트만 Gemini 프롬프트에 넣습니다.
+    """
+    timeout = aiohttp.ClientTimeout(total=10)
+    headers = {
+        "User-Agent": "Team0x34Bot/1.0 (+https://discord.com)",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    }
+
+    try:
+        async with aiohttp.ClientSession(timeout=timeout, headers=headers) as session:
+            async with session.get(url, allow_redirects=True) as response:
+                if response.status >= 400:
+                    raise ScrapingError(f"HTTP {response.status}")
+                html = await response.text(errors="ignore")
+    except (aiohttp.ClientError, TimeoutError, asyncio.TimeoutError) as exc:
+        raise ScrapingError(str(exc)) from exc
+
+    soup = BeautifulSoup(html, "html.parser")
+    for tag in soup(["script", "style"]):
+        tag.decompose()
+
+    scraped_text = normalize_scraped_text(soup.get_text(separator=" "))
+    if not scraped_text:
+        raise ScrapingError("empty page text")
+    return scraped_text
 
 
 def _strip_json_code_fence(value: str) -> str:
@@ -456,7 +507,7 @@ class RecruitmentCog(commands.Cog):
             return None
         return await self.remove_user_from_private_thread(thread, user)
 
-    def _generate_recruitment_copy_sync(self, target_info: str) -> str:
+    def _generate_recruitment_copy_sync(self, source_text: str) -> str:
         """Gemini SDK의 동기 API를 호출합니다.
 
         google-generativeai의 기본 호출은 네트워크 I/O가 끝날 때까지 현재 스레드를 붙잡습니다.
@@ -472,7 +523,9 @@ class RecruitmentCog(commands.Cog):
             system_instruction=GEMINI_SYSTEM_PROMPT,
         )
         response = model.generate_content(
-            f"Team 0x34 Discord 서버에 올릴 팀원 모집 글을 작성해 주세요.\n\n입력:\n{target_info}",
+            "다음은 해커톤/대회 웹사이트에서 추출한 실제 텍스트 내용입니다: "
+            f"\n\n{source_text}\n\n"
+            "이 텍스트 내용만을 엄격하게 바탕으로, 없는 내용을 지어내지 말고 다음 규칙에 따라 모집글을 작성해라.",
             generation_config={
                 "temperature": 0.4,
                 "response_mime_type": "application/json",
@@ -480,10 +533,16 @@ class RecruitmentCog(commands.Cog):
         )
         return str(getattr(response, "text", "") or "")
 
-    async def generate_recruitment_copy(self, target_info: str) -> tuple[str, str]:
+    async def generate_recruitment_copy(self, source_text: str) -> tuple[str, str]:
         """Gemini 호출을 백그라운드 스레드로 넘기고, 응답을 Embed용 데이터로 파싱합니다."""
-        raw_text = await asyncio.to_thread(self._generate_recruitment_copy_sync, target_info)
-        return parse_gemini_recruitment(raw_text, target_info)
+        raw_text = await asyncio.to_thread(self._generate_recruitment_copy_sync, source_text)
+        return parse_gemini_recruitment(raw_text, source_text)
+
+    async def prepare_recruitment_source_text(self, target_info: str) -> str:
+        """URL이면 웹페이지를 크롤링하고, 일반 텍스트면 그대로 Gemini 입력으로 사용합니다."""
+        if not is_url(target_info):
+            return _trim_text(target_info, MAX_SCRAPED_TEXT_LENGTH)
+        return await extract_text_from_url(target_info)
 
     async def get_recruitment(self, message_id: int):
         """메시지 ID로 모집 레코드를 찾습니다."""
@@ -553,7 +612,13 @@ class RecruitmentCog(commands.Cog):
             return
 
         try:
-            title, description = await self.generate_recruitment_copy(target_info)
+            source_text = await self.prepare_recruitment_source_text(target_info)
+        except ScrapingError:
+            await interaction.followup.send(SCRAPING_ERROR_MESSAGE, ephemeral=True)
+            return
+
+        try:
+            title, description = await self.generate_recruitment_copy(source_text)
         except RuntimeError as exc:
             await interaction.followup.send(str(exc), ephemeral=True)
             return
