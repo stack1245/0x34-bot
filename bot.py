@@ -15,6 +15,7 @@ EXTENSIONS: tuple[str, ...] = (
     "cogs.schedule",
     "cogs.tournament",
     "cogs.recruitment",
+    "cogs.maintenance",
 )
 
 
