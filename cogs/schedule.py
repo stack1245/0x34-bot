@@ -179,8 +179,10 @@ class ScheduleDeleteSelect(discord.ui.Select):
 
     async def callback(self, interaction: discord.Interaction) -> None:
         """선택한 schedule id로 DB 레코드를 삭제하고 View를 제거합니다."""
+        await interaction.response.defer(ephemeral=True)
+
         if interaction.guild is None:
-            await interaction.response.edit_message(content="서버 안에서만 일정을 삭제할 수 있습니다.", embed=None, view=None)
+            await interaction.edit_original_response(content="서버 안에서만 일정을 삭제할 수 있습니다.", embed=None, view=None)
             return
 
         schedule_id = int(self.values[0])
@@ -192,18 +194,17 @@ class ScheduleDeleteSelect(discord.ui.Select):
             (schedule_id, interaction.guild.id),
         )
         if row is None:
-            await interaction.response.edit_message(content="이미 삭제되었거나 찾을 수 없는 일정입니다.", embed=None, view=None)
+            await interaction.edit_original_response(content="이미 삭제되었거나 찾을 수 없는 일정입니다.", embed=None, view=None)
             return
 
-        title = str(row["title"])
         event_notice = await self.cog.delete_linked_server_event(interaction.guild, row["event_id"])
         await self.cog.bot.database.execute("DELETE FROM schedules WHERE id = ?", (schedule_id,))
         await self.cog.update_schedule_board()
 
-        message = f"✅ {title} 일정이 성공적으로 삭제되었습니다."
+        message = "✅ 성공적으로 일정이 삭제되었습니다."
         if event_notice:
             message += f"\n{event_notice}"
-        await interaction.response.edit_message(content=message, embed=None, view=None)
+        await interaction.edit_original_response(content=message, embed=None, view=None)
 
 
 class ScheduleDeleteView(discord.ui.View):
