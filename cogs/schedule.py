@@ -108,6 +108,75 @@ class ScheduleModal(discord.ui.Modal, title="일정 추가"):
         )
 
 
+class ScheduleDeleteSelect(discord.ui.Select):
+    """등록된 일정 목록을 드롭다운으로 보여주고 선택된 일정을 삭제합니다."""
+
+    def __init__(self, cog: "ScheduleCog", rows: list) -> None:
+        self.cog = cog
+        options: list[discord.SelectOption] = []
+
+        for row in rows:
+            starts_at = from_storage_iso(row["starts_at"], cog.bot.settings.timezone)
+            label = str(row["title"])[:100]
+            description = starts_at.strftime("%Y-%m-%d %H:%M")
+            options.append(
+                discord.SelectOption(
+                    label=label,
+                    description=description,
+                    value=str(row["id"]),
+                )
+            )
+
+        super().__init__(
+            placeholder="삭제할 일정을 선택하세요.",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        """선택한 schedule id로 DB 레코드를 삭제하고 View를 제거합니다."""
+        if interaction.guild is None:
+            await interaction.response.edit_message(content="서버 안에서만 일정을 삭제할 수 있습니다.", embed=None, view=None)
+            return
+
+        schedule_id = int(self.values[0])
+        row = await self.cog.bot.database.fetch_one(
+            """
+            SELECT * FROM schedules
+            WHERE id = ? AND guild_id = ?
+            """,
+            (schedule_id, interaction.guild.id),
+        )
+        if row is None:
+            await interaction.response.edit_message(content="이미 삭제되었거나 찾을 수 없는 일정입니다.", embed=None, view=None)
+            return
+
+        title = str(row["title"])
+        event_notice = await self.cog.delete_linked_server_event(interaction.guild, row["event_id"])
+        await self.cog.bot.database.execute("DELETE FROM schedules WHERE id = ?", (schedule_id,))
+
+        message = f"✅ {title} 일정이 성공적으로 삭제되었습니다."
+        if event_notice:
+            message += f"\n{event_notice}"
+        await interaction.response.edit_message(content=message, embed=None, view=None)
+
+
+class ScheduleDeleteView(discord.ui.View):
+    """일정 삭제 Select를 담는 Ephemeral View입니다."""
+
+    def __init__(self, cog: "ScheduleCog", rows: list, user_id: int) -> None:
+        super().__init__(timeout=120)
+        self.user_id = user_id
+        self.add_item(ScheduleDeleteSelect(cog, rows))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.user_id:
+            return True
+        await interaction.response.send_message("이 일정 삭제 메뉴는 명령어를 실행한 사람만 사용할 수 있습니다.", ephemeral=True)
+        return False
+
+
 class ScheduleCog(commands.Cog):
     """일정 조회와 일정 추가 기능을 담당하는 Cog입니다."""
 
@@ -154,6 +223,24 @@ class ScheduleCog(commands.Cog):
         if isinstance(channel, discord.abc.Messageable):
             return channel
         return None
+
+    async def delete_linked_server_event(self, guild: discord.Guild, event_id) -> str | None:
+        """DB 일정과 연결된 Discord 서버 이벤트가 있으면 함께 삭제합니다."""
+        if event_id is None:
+            return None
+
+        try:
+            event = await guild.fetch_scheduled_event(int(event_id))
+            await event.delete(reason="Team 0x34 일정 삭제")
+        except (TypeError, ValueError):
+            return "저장된 서버 이벤트 ID가 올바르지 않아 Discord 이벤트는 삭제하지 못했습니다."
+        except discord.NotFound:
+            return "연결된 서버 이벤트는 이미 삭제되어 있었습니다."
+        except discord.Forbidden:
+            return "서버 이벤트 삭제 권한이 없어 Discord 이벤트는 삭제하지 못했습니다."
+        except discord.HTTPException as exc:
+            return f"서버 이벤트 삭제 중 오류가 발생했습니다: {exc.text}"
+        return "연결된 Discord 서버 이벤트도 함께 삭제했습니다."
 
     def parse_generated_schedules(self, raw_text: str) -> list[dict]:
         """Gemini가 반환한 JSON 배열을 Python 리스트로 변환합니다."""
@@ -297,6 +384,34 @@ class ScheduleCog(commands.Cog):
     async def add_schedule(self, interaction: discord.Interaction) -> None:
         """Discord Modal을 열어 일정 정보를 입력받습니다."""
         await interaction.response.send_modal(ScheduleModal(self))
+
+    @app_commands.command(name="일정삭제", description="드롭다운 메뉴로 등록된 일정을 삭제합니다.")
+    async def delete_schedule(self, interaction: discord.Interaction) -> None:
+        """등록된 일정 최대 25개를 Select Menu로 보여주고 선택한 일정을 삭제합니다."""
+        if interaction.guild is None:
+            await interaction.response.send_message("서버 안에서만 일정을 삭제할 수 있습니다.", ephemeral=True)
+            return
+
+        rows = await self.bot.database.fetch_all(
+            """
+            SELECT id, title, starts_at, event_id FROM schedules
+            WHERE guild_id = ?
+            ORDER BY starts_at ASC
+            LIMIT 25
+            """,
+            (interaction.guild.id,),
+        )
+
+        if not rows:
+            await interaction.response.send_message("등록된 일정이 없습니다.", ephemeral=True)
+            return
+
+        embed = base_embed(
+            "삭제할 일정을 선택하세요",
+            "드롭다운에는 가까운 일정부터 최대 25개까지 표시됩니다.",
+            color=WARNING_COLOR,
+        )
+        await interaction.response.send_message(embed=embed, view=ScheduleDeleteView(self, rows, interaction.user.id), ephemeral=True)
 
     @app_commands.command(name="일정생성", description="Gemini로 안내 텍스트에서 여러 일정을 자동 등록합니다.")
     @app_commands.describe(target_info="참가 신청, 예선, 본선 등 일정을 추출할 대회/행사 안내 텍스트")
