@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 from datetime import datetime, timedelta
 
 import discord
@@ -28,6 +29,11 @@ MAX_SCHEDULE_SOURCE_TEXT_LENGTH = 12000
 SCRAPING_ERROR_MESSAGE = "웹페이지 내용을 불러오지 못했습니다. 사이트 링크 대신 상세 텍스트를 직접 입력해 주세요."
 GEMINI_RATE_LIMIT_MESSAGE = "⚠️ 봇이 너무 많은 요청을 처리하고 있습니다. 1분 뒤에 다시 시도해 주세요."
 SCHEDULE_BOARD_STATE_KEY = "schedule_board"
+DISCORD_EVENT_SYNC_TAGS = ("[예선]", "[본선]")
+DISCORD_EVENT_SYNC_KEYWORDS = ("예선", "본선")
+SCHEDULE_END_LINE_PATTERN = re.compile(r"^\*\*종료\*\*\s*<t:(\d+)(?::[tTdDfFR])?>", re.MULTILINE)
+SCHEDULE_LOCATION_LINE_PATTERN = re.compile(r"^\*\*장소\*\*\s*(.+)$", re.MULTILINE)
+SCHEDULE_METADATA_LINE_PATTERN = re.compile(r"^\*\*(?:종료|장소)\*\*.*(?:\n|$)", re.MULTILINE)
 
 
 SCHEDULE_GENERATION_PROMPT = """
@@ -410,6 +416,115 @@ class ScheduleCog(commands.Cog):
             return None, f"서버 이벤트 생성에 실패해 DB에만 저장했습니다: {exc.text}"
         return event.id, "Discord 서버 이벤트도 함께 생성했습니다."
 
+    def should_sync_discord_event(self, schedule_row) -> bool:
+        """대시보드 갱신 중 공식 서버 이벤트로 보정할 가치가 있는 일정인지 판단합니다."""
+        if schedule_row["event_id"] is not None:
+            return False
+
+        title = str(schedule_row["title"])
+        compact_title = title.replace(" ", "")
+        return any(tag in title for tag in DISCORD_EVENT_SYNC_TAGS) or any(
+            keyword.replace(" ", "") in compact_title for keyword in DISCORD_EVENT_SYNC_KEYWORDS
+        )
+
+    def parse_schedule_event_fields(self, schedule_row) -> tuple[datetime, datetime, str, str]:
+        """schedules 행의 starts_at/body에서 Discord Scheduled Event 필드를 추출합니다."""
+        starts_at = from_storage_iso(schedule_row["starts_at"], self.bot.settings.timezone)
+        body = str(schedule_row["body"] or "")
+
+        end_match = SCHEDULE_END_LINE_PATTERN.search(body)
+        if end_match is None:
+            ends_at = starts_at + timedelta(hours=1)
+        else:
+            ends_at = datetime.fromtimestamp(int(end_match.group(1)), tz=starts_at.tzinfo)
+            if ends_at <= starts_at:
+                ends_at = starts_at + timedelta(hours=1)
+
+        location_match = SCHEDULE_LOCATION_LINE_PATTERN.search(body)
+        location = location_match.group(1).strip() if location_match is not None else "Discord"
+        if not location or location == "공개된 정보 없음":
+            location = "Discord"
+
+        description = SCHEDULE_METADATA_LINE_PATTERN.sub("", body).strip() or str(schedule_row["title"])
+        return starts_at, ends_at, location[:100], description[:1000]
+
+    async def find_existing_discord_event(self, guild: discord.Guild, title: str, starts_at: datetime) -> discord.ScheduledEvent | None:
+        """DB event_id는 없지만 같은 이름/시작 시간의 서버 이벤트가 이미 있는지 확인합니다."""
+        try:
+            scheduled_events = await guild.fetch_scheduled_events()
+        except discord.Forbidden as exc:
+            logging.warning("Missing permission to fetch scheduled events for guild %s: %s", guild.id, exc)
+            return None
+        except discord.HTTPException as exc:
+            logging.warning("Failed to fetch scheduled events for guild %s: %s", guild.id, exc)
+            return None
+
+        event_name = title[:100]
+        for event in scheduled_events:
+            event_start = getattr(event, "start_time", None)
+            if event_start is None or event.name != event_name:
+                continue
+            try:
+                if abs((event_start - starts_at).total_seconds()) < 60:
+                    return event
+            except TypeError:
+                continue
+        return None
+
+    async def create_discord_event(self, schedule_row) -> int | None:
+        """schedules 행을 기준으로 Discord 공식 Scheduled Event를 만들고 event_id를 DB에 저장합니다."""
+        if not self.bot.settings.enable_server_events or schedule_row["event_id"] is not None:
+            return None
+
+        try:
+            guild_id = int(schedule_row["guild_id"])
+            schedule_id = int(schedule_row["id"])
+        except (TypeError, ValueError):
+            return None
+
+        guild = self.bot.get_guild(guild_id)
+        if guild is None:
+            try:
+                guild = await self.bot.fetch_guild(guild_id)
+            except (discord.NotFound, discord.Forbidden, discord.HTTPException) as exc:
+                logging.warning("Failed to resolve guild %s for schedule event sync: %s", guild_id, exc)
+                return None
+
+        title = str(schedule_row["title"])[:100]
+        starts_at, ends_at, location, description = self.parse_schedule_event_fields(schedule_row)
+
+        existing_event = await self.find_existing_discord_event(guild, title, starts_at)
+        if existing_event is not None:
+            await self.bot.database.execute(
+                "UPDATE schedules SET event_id = ? WHERE id = ?",
+                (existing_event.id, schedule_id),
+            )
+            return existing_event.id
+
+        try:
+            event = await guild.create_scheduled_event(
+                name=title,
+                start_time=starts_at,
+                end_time=ends_at,
+                description=description,
+                entity_type=discord.EntityType.external,
+                privacy_level=discord.PrivacyLevel.guild_only,
+                location=location,
+                reason="Team 0x34 일정 대시보드 서버 이벤트 동기화",
+            )
+        except discord.Forbidden as exc:
+            logging.warning("Missing permission to create scheduled event for schedule %s: %s", schedule_id, exc)
+            return None
+        except discord.HTTPException as exc:
+            logging.warning("Failed to create scheduled event for schedule %s: %s", schedule_id, exc)
+            return None
+
+        await self.bot.database.execute(
+            "UPDATE schedules SET event_id = ? WHERE id = ?",
+            (event.id, schedule_id),
+        )
+        return event.id
+
     async def resolve_schedule_channel(self, interaction: discord.Interaction) -> discord.abc.Messageable | None:
         """환경 변수에 일정 채널이 지정된 경우 공지할 채널을 찾습니다."""
         channel_id = self.bot.settings.schedule_channel_id
@@ -522,6 +637,21 @@ class ScheduleCog(commands.Cog):
             ORDER BY starts_at ASC
             """,
         )
+        synced_event = False
+        for row in rows:
+            if self.should_sync_discord_event(row):
+                event_id = await self.create_discord_event(row)
+                if event_id is not None:
+                    synced_event = True
+
+        if synced_event:
+            rows = await self.bot.database.fetch_all(
+                """
+                SELECT * FROM schedules
+                ORDER BY starts_at ASC
+                """,
+            )
+
         embed = self.build_schedule_board_embed(rows)
         state = await self.fetch_schedule_board_state()
 
