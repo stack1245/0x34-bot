@@ -25,8 +25,10 @@ DEFAULT_AI_RECRUITMENT_CAPACITY = 4
 MAX_AI_TITLE_LENGTH = 50
 MAX_EMBED_DESCRIPTION_LENGTH = 3900
 MAX_SCRAPED_TEXT_LENGTH = 5000
+MAX_RECRUITMENT_SOURCE_TEXT_LENGTH = 12000
 SCRAPING_ERROR_MESSAGE = "웹페이지 내용을 불러오지 못했습니다. 사이트 링크 대신 상세 텍스트를 직접 입력해 주세요."
-URL_PATTERN = re.compile(r"^https?://[^\s<>()]+$", re.IGNORECASE)
+URL_PATTERN = re.compile(r"https?://[^\s<>()]+", re.IGNORECASE)
+URL_TRAILING_PUNCTUATION = ".,;:!?)]}>'\""
 
 
 GEMINI_SYSTEM_PROMPT = """
@@ -52,6 +54,51 @@ def _trim_text(value: str, limit: int) -> str:
 def is_url(value: str) -> bool:
     """target_info가 http/https URL인지 정규식으로 확인합니다."""
     return URL_PATTERN.fullmatch(value.strip()) is not None
+
+
+def extract_urls(value: str) -> list[str]:
+    """target_info 안에 섞여 있는 모든 URL을 입력 순서대로 추출합니다."""
+    urls: list[str] = []
+    for match in re.findall(URL_PATTERN, value):
+        url = match.rstrip(URL_TRAILING_PUNCTUATION)
+        if url and url not in urls:
+            urls.append(url)
+    return urls
+
+
+def remove_urls_for_plain_text(value: str, urls: list[str]) -> str:
+    """모든 URL을 뺀 나머지 사용자 텍스트가 있는지 확인합니다."""
+    text = value
+    for url in urls:
+        text = text.replace(url, " ")
+    return re.sub(r"[\s.,;:!?()[\]{}'\"<>]+", " ", text).strip()
+
+
+def replace_urls_with_scraped_text(value: str, scraped_by_url: dict[str, str], failed_urls: set[str]) -> str:
+    """입력 문장 안의 URL 위치를 크롤링한 텍스트 또는 실패 안내로 치환합니다."""
+    pieces: list[str] = []
+    cursor = 0
+
+    for match in URL_PATTERN.finditer(value):
+        raw_url = match.group(0)
+        url = raw_url.rstrip(URL_TRAILING_PUNCTUATION)
+        start = match.start()
+        end = start + len(url)
+
+        pieces.append(value[cursor:start])
+        if url in scraped_by_url:
+            pieces.append(f"\n\n[크롤링한 URL: {url}]\n{scraped_by_url[url]}\n\n")
+        elif url in failed_urls:
+            pieces.append(f"\n\n[크롤링 실패 URL: {url}]\n웹페이지 내용을 불러오지 못했습니다.\n\n")
+        else:
+            pieces.append(url)
+        cursor = end
+
+    pieces.append(value[cursor:])
+    merged_text = "".join(pieces)
+    merged_text = re.sub(r"[ \t\r\f\v]+", " ", merged_text)
+    merged_text = re.sub(r"\n{3,}", "\n\n", merged_text).strip()
+    return _trim_text(merged_text, MAX_RECRUITMENT_SOURCE_TEXT_LENGTH)
 
 
 def normalize_scraped_text(value: str) -> str:
@@ -539,10 +586,35 @@ class RecruitmentCog(commands.Cog):
         return parse_gemini_recruitment(raw_text, source_text)
 
     async def prepare_recruitment_source_text(self, target_info: str) -> str:
-        """URL이면 웹페이지를 크롤링하고, 일반 텍스트면 그대로 Gemini 입력으로 사용합니다."""
-        if not is_url(target_info):
-            return _trim_text(target_info, MAX_SCRAPED_TEXT_LENGTH)
-        return await extract_text_from_url(target_info)
+        """입력 텍스트에 포함된 여러 URL을 동시에 크롤링하고 일반 텍스트와 병합합니다."""
+        urls = extract_urls(target_info)
+        if not urls:
+            return _trim_text(target_info, MAX_RECRUITMENT_SOURCE_TEXT_LENGTH)
+
+        # URL이 여러 개일 때 `for url in urls: await ...`처럼 순차 처리하면
+        # 첫 번째 사이트가 느린 동안 뒤 URL들은 시작조차 하지 못합니다.
+        # asyncio.gather는 모든 extract_text_from_url 코루틴을 동시에 스케줄링하므로
+        # 전체 대기 시간이 URL 개수의 합이 아니라 가장 느린 요청 시간에 가깝게 줄어듭니다.
+        # return_exceptions=True를 주면 일부 URL이 403/타임아웃으로 실패해도 gather 전체가 취소되지 않고,
+        # 아래에서 성공한 결과만 골라 Gemini 프롬프트에 사용할 수 있습니다.
+        scraping_results = await asyncio.gather(
+            *(extract_text_from_url(url) for url in urls),
+            return_exceptions=True,
+        )
+
+        scraped_by_url: dict[str, str] = {}
+        failed_urls: set[str] = set()
+        for url, result in zip(urls, scraping_results):
+            if isinstance(result, Exception):
+                failed_urls.add(url)
+                logging.info("Failed to scrape recruitment URL %s: %s", url, result)
+                continue
+            scraped_by_url[url] = result
+
+        if not scraped_by_url and not remove_urls_for_plain_text(target_info, urls):
+            raise ScrapingError("all URLs failed")
+
+        return replace_urls_with_scraped_text(target_info, scraped_by_url, failed_urls)
 
     async def get_recruitment(self, message_id: int):
         """메시지 ID로 모집 레코드를 찾습니다."""
