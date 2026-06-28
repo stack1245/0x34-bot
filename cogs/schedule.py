@@ -177,6 +177,154 @@ class ScheduleDeleteView(discord.ui.View):
         return False
 
 
+class ScheduleEditModal(discord.ui.Modal, title="일정 수정"):
+    """기존 일정 값을 채운 상태로 열리는 수정 Modal입니다."""
+
+    def __init__(self, cog: "ScheduleCog", row, source_message: discord.Message | None, user_id: int) -> None:
+        super().__init__()
+        self.cog = cog
+        self.schedule_id = int(row["id"])
+        self.event_id = row["event_id"]
+        self.source_message = source_message
+        self.user_id = user_id
+
+        starts_at = from_storage_iso(row["starts_at"], cog.bot.settings.timezone)
+        self.title_input = discord.ui.TextInput(
+            label="제목",
+            placeholder="예: Team 0x34 정기 회의",
+            default=str(row["title"])[:100],
+            max_length=100,
+        )
+        self.starts_at_input = discord.ui.TextInput(
+            label="날짜/시간",
+            placeholder="예: 2026-07-01 19:00",
+            default=starts_at.strftime("%Y-%m-%d %H:%M"),
+            max_length=40,
+        )
+        self.body_input = discord.ui.TextInput(
+            label="내용",
+            placeholder="회의 안건, 준비물, 장소 등을 적어 주세요.",
+            default=str(row["body"])[:1000],
+            style=discord.TextStyle.long,
+            max_length=1000,
+        )
+        self.add_item(self.title_input)
+        self.add_item(self.starts_at_input)
+        self.add_item(self.body_input)
+
+    async def disable_source_view(self) -> None:
+        if self.source_message is None:
+            return
+        try:
+            await self.source_message.edit(view=None)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("서버 안에서만 일정을 수정할 수 있습니다.", ephemeral=True)
+            return
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("이 일정 수정 창은 명령어를 실행한 사람만 제출할 수 있습니다.", ephemeral=True)
+            return
+
+        try:
+            starts_at = parse_datetime(str(self.starts_at_input.value), self.cog.bot.settings.timezone)
+        except ValueError as exc:
+            await interaction.response.send_message(str(exc), ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        row = await self.cog.bot.database.fetch_one(
+            """
+            SELECT * FROM schedules
+            WHERE id = ? AND guild_id = ?
+            """,
+            (self.schedule_id, interaction.guild.id),
+        )
+        if row is None:
+            await self.disable_source_view()
+            await interaction.followup.send("수정할 일정을 찾을 수 없습니다.", ephemeral=True)
+            return
+
+        title = str(self.title_input.value).strip()
+        body = str(self.body_input.value).strip()
+        await self.cog.bot.database.execute(
+            """
+            UPDATE schedules
+            SET title = ?, starts_at = ?, body = ?
+            WHERE id = ? AND guild_id = ?
+            """,
+            (title, to_storage_iso(starts_at), body, self.schedule_id, interaction.guild.id),
+        )
+
+        event_notice = await self.cog.edit_linked_server_event(interaction.guild, row["event_id"], title, starts_at, body)
+        await self.disable_source_view()
+
+        message = "✅ 성공적으로 수정되었습니다."
+        if event_notice:
+            message += f"\n{event_notice}"
+        await interaction.followup.send(message, ephemeral=True)
+
+
+class ScheduleEditSelect(discord.ui.Select):
+    """수정할 일정을 선택하는 드롭다운입니다."""
+
+    def __init__(self, cog: "ScheduleCog", rows: list) -> None:
+        self.cog = cog
+        options: list[discord.SelectOption] = []
+        for row in rows:
+            starts_at = from_storage_iso(row["starts_at"], cog.bot.settings.timezone)
+            options.append(
+                discord.SelectOption(
+                    label=str(row["title"])[:100],
+                    description=starts_at.strftime("%Y-%m-%d %H:%M"),
+                    value=str(row["id"]),
+                )
+            )
+
+        super().__init__(
+            placeholder="수정할 일정을 선택하세요.",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            await interaction.response.edit_message(content="서버 안에서만 일정을 수정할 수 있습니다.", embed=None, view=None)
+            return
+
+        schedule_id = int(self.values[0])
+        row = await self.cog.bot.database.fetch_one(
+            """
+            SELECT * FROM schedules
+            WHERE id = ? AND guild_id = ?
+            """,
+            (schedule_id, interaction.guild.id),
+        )
+        if row is None:
+            await interaction.response.edit_message(content="이미 삭제되었거나 찾을 수 없는 일정입니다.", embed=None, view=None)
+            return
+
+        await interaction.response.send_modal(ScheduleEditModal(self.cog, row, interaction.message, interaction.user.id))
+
+
+class ScheduleEditView(discord.ui.View):
+    """일정 수정 Select를 담는 Ephemeral View입니다."""
+
+    def __init__(self, cog: "ScheduleCog", rows: list, user_id: int) -> None:
+        super().__init__(timeout=120)
+        self.user_id = user_id
+        self.add_item(ScheduleEditSelect(cog, rows))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.user_id:
+            return True
+        await interaction.response.send_message("이 일정 수정 메뉴는 명령어를 실행한 사람만 사용할 수 있습니다.", ephemeral=True)
+        return False
+
+
 class ScheduleCog(commands.Cog):
     """일정 조회와 일정 추가 기능을 담당하는 Cog입니다."""
 
@@ -241,6 +389,30 @@ class ScheduleCog(commands.Cog):
         except discord.HTTPException as exc:
             return f"서버 이벤트 삭제 중 오류가 발생했습니다: {exc.text}"
         return "연결된 Discord 서버 이벤트도 함께 삭제했습니다."
+
+    async def edit_linked_server_event(self, guild: discord.Guild, event_id, title: str, starts_at, body: str) -> str | None:
+        """DB 일정과 연결된 Discord 서버 이벤트가 있으면 수정 내용도 반영합니다."""
+        if event_id is None:
+            return None
+
+        try:
+            event = await guild.fetch_scheduled_event(int(event_id))
+            await event.edit(
+                name=title[:100],
+                start_time=starts_at,
+                end_time=starts_at + timedelta(hours=1),
+                description=body[:1000],
+                reason="Team 0x34 일정 수정",
+            )
+        except (TypeError, ValueError):
+            return "저장된 서버 이벤트 ID가 올바르지 않아 Discord 이벤트는 수정하지 못했습니다."
+        except discord.NotFound:
+            return "연결된 서버 이벤트를 찾을 수 없어 Discord 이벤트는 수정하지 못했습니다."
+        except discord.Forbidden:
+            return "서버 이벤트 수정 권한이 없어 Discord 이벤트는 수정하지 못했습니다."
+        except discord.HTTPException as exc:
+            return f"서버 이벤트 수정 중 오류가 발생했습니다: {exc.text}"
+        return "연결된 Discord 서버 이벤트도 함께 수정했습니다."
 
     def parse_generated_schedules(self, raw_text: str) -> list[dict]:
         """Gemini가 반환한 JSON 배열을 Python 리스트로 변환합니다."""
@@ -412,6 +584,34 @@ class ScheduleCog(commands.Cog):
             color=WARNING_COLOR,
         )
         await interaction.response.send_message(embed=embed, view=ScheduleDeleteView(self, rows, interaction.user.id), ephemeral=True)
+
+    @app_commands.command(name="일정수정", description="드롭다운 메뉴와 Modal로 등록된 일정을 수정합니다.")
+    async def edit_schedule(self, interaction: discord.Interaction) -> None:
+        """내가 작성했거나 아직 지나지 않은 일정 최대 25개를 Select Menu로 보여줍니다."""
+        if interaction.guild is None:
+            await interaction.response.send_message("서버 안에서만 일정을 수정할 수 있습니다.", ephemeral=True)
+            return
+
+        rows = await self.bot.database.fetch_all(
+            """
+            SELECT id, title, starts_at, body, created_by, event_id FROM schedules
+            WHERE guild_id = ? AND (created_by = ? OR starts_at >= ?)
+            ORDER BY starts_at ASC
+            LIMIT 25
+            """,
+            (interaction.guild.id, interaction.user.id, now_utc_iso()),
+        )
+
+        if not rows:
+            await interaction.response.send_message("수정할 일정이 없습니다.", ephemeral=True)
+            return
+
+        embed = base_embed(
+            "수정할 일정을 선택하세요",
+            "내가 작성했거나 아직 지나지 않은 일정이 최대 25개까지 표시됩니다.",
+            color=WARNING_COLOR,
+        )
+        await interaction.response.send_message(embed=embed, view=ScheduleEditView(self, rows, interaction.user.id), ephemeral=True)
 
     @app_commands.command(name="일정생성", description="Gemini로 안내 텍스트에서 여러 일정을 자동 등록합니다.")
     @app_commands.describe(target_info="참가 신청, 예선, 본선 등 일정을 추출할 대회/행사 안내 텍스트")

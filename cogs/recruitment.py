@@ -377,6 +377,168 @@ class RecruitmentModal(discord.ui.Modal, title="팀원 모집"):
         await interaction.followup.send(response, ephemeral=True)
 
 
+class RecruitmentEditModal(discord.ui.Modal, title="모집 수정"):
+    """기존 모집 데이터를 TextInput default로 채워서 여는 수정 Modal입니다."""
+
+    def __init__(self, cog: "RecruitmentCog", row, source_message: discord.Message | None, user_id: int) -> None:
+        super().__init__()
+        self.cog = cog
+        self.recruitment_id = int(row["id"])
+        self.channel_id = int(row["channel_id"])
+        self.message_id = int(row["message_id"])
+        self.source_message = source_message
+        self.user_id = user_id
+
+        self.title_input = discord.ui.TextInput(
+            label="모집 제목",
+            placeholder="예: DEF CON Quals 팀원 모집",
+            default=str(row["title"])[:100],
+            max_length=100,
+        )
+        self.target_input = discord.ui.TextInput(
+            label="대회/프로젝트 설명",
+            placeholder="모집 목적, 기간, 필요한 역할 등을 적어 주세요.",
+            default=_trim_text(str(row["target"]), MAX_EMBED_DESCRIPTION_LENGTH),
+            style=discord.TextStyle.long,
+            max_length=MAX_EMBED_DESCRIPTION_LENGTH,
+        )
+        self.max_members_input = discord.ui.TextInput(
+            label="정원",
+            placeholder="예: 4",
+            default=str(row["max_members"])[:6],
+            max_length=6,
+        )
+        self.add_item(self.title_input)
+        self.add_item(self.target_input)
+        self.add_item(self.max_members_input)
+
+    async def disable_source_view(self) -> None:
+        if self.source_message is None:
+            return
+        try:
+            await self.source_message.edit(view=None)
+        except (discord.NotFound, discord.Forbidden, discord.HTTPException):
+            return
+
+    async def on_submit(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            await interaction.response.send_message("서버 안에서만 모집을 수정할 수 있습니다.", ephemeral=True)
+            return
+        if interaction.user.id != self.user_id:
+            await interaction.response.send_message("이 모집 수정 창은 명령어를 실행한 사람만 제출할 수 있습니다.", ephemeral=True)
+            return
+
+        try:
+            max_members = int(str(self.max_members_input.value).strip())
+        except ValueError:
+            await interaction.response.send_message("정원은 숫자로 입력해 주세요.", ephemeral=True)
+            return
+        if max_members < 0:
+            await interaction.response.send_message("정원은 0 이상이어야 합니다. 0은 제한 없음입니다.", ephemeral=True)
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        row = await self.cog.bot.database.fetch_one(
+            """
+            SELECT * FROM recruitments
+            WHERE id = ? AND guild_id = ?
+            """,
+            (self.recruitment_id, interaction.guild.id),
+        )
+        if row is None:
+            await self.disable_source_view()
+            await interaction.followup.send("수정할 모집 글을 찾을 수 없습니다.", ephemeral=True)
+            return
+        if row["author_id"] != interaction.user.id and row["status"] != STATUS_OPEN:
+            await interaction.followup.send("모집 작성자이거나 현재 모집 중인 글만 수정할 수 있습니다.", ephemeral=True)
+            return
+
+        title = str(self.title_input.value).strip()
+        target = _trim_text(str(self.target_input.value), MAX_EMBED_DESCRIPTION_LENGTH)
+
+        # aiosqlite UPDATE를 먼저 실행해 DB를 최신 상태로 만든 뒤 Embed를 다시 빌드합니다.
+        # Database.execute()는 내부에서 commit까지 수행하므로, 아래 build_recruitment_embed()는
+        # 방금 저장한 title/target/max_members 값을 같은 DB 연결에서 바로 읽을 수 있습니다.
+        await self.cog.bot.database.execute(
+            """
+            UPDATE recruitments
+            SET title = ?, target = ?, max_members = ?
+            WHERE id = ? AND guild_id = ?
+            """,
+            (title, target, max_members, self.recruitment_id, interaction.guild.id),
+        )
+
+        message_notice = await self.cog.edit_recruitment_message(self.channel_id, self.message_id)
+        await self.disable_source_view()
+
+        response = "✅ 성공적으로 수정되었습니다."
+        if message_notice:
+            response += f"\n{message_notice}"
+        await interaction.followup.send(response, ephemeral=True)
+
+
+class RecruitmentEditSelect(discord.ui.Select):
+    """수정할 모집 글을 선택하는 드롭다운입니다."""
+
+    def __init__(self, cog: "RecruitmentCog", rows: list) -> None:
+        self.cog = cog
+        options: list[discord.SelectOption] = []
+        for row in rows:
+            status_text = "모집 중" if row["status"] == STATUS_OPEN else "모집 마감"
+            capacity_text = "제한 없음" if row["max_members"] == 0 else f"정원 {row['max_members']}명"
+            options.append(
+                discord.SelectOption(
+                    label=str(row["title"])[:100],
+                    description=f"{status_text} · {capacity_text}"[:100],
+                    value=str(row["id"]),
+                )
+            )
+
+        super().__init__(
+            placeholder="수정할 모집 글을 선택하세요.",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.guild is None:
+            await interaction.response.edit_message(content="서버 안에서만 모집을 수정할 수 있습니다.", embed=None, view=None)
+            return
+
+        recruitment_id = int(self.values[0])
+        row = await self.cog.bot.database.fetch_one(
+            """
+            SELECT * FROM recruitments
+            WHERE id = ? AND guild_id = ?
+            """,
+            (recruitment_id, interaction.guild.id),
+        )
+        if row is None:
+            await interaction.response.edit_message(content="이미 삭제되었거나 찾을 수 없는 모집 글입니다.", embed=None, view=None)
+            return
+        if row["author_id"] != interaction.user.id and row["status"] != STATUS_OPEN:
+            await interaction.response.send_message("모집 작성자이거나 현재 모집 중인 글만 수정할 수 있습니다.", ephemeral=True)
+            return
+
+        await interaction.response.send_modal(RecruitmentEditModal(self.cog, row, interaction.message, interaction.user.id))
+
+
+class RecruitmentEditView(discord.ui.View):
+    """모집 수정 Select를 담는 Ephemeral View입니다."""
+
+    def __init__(self, cog: "RecruitmentCog", rows: list, user_id: int) -> None:
+        super().__init__(timeout=120)
+        self.user_id = user_id
+        self.add_item(RecruitmentEditSelect(cog, rows))
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        if interaction.user.id == self.user_id:
+            return True
+        await interaction.response.send_message("이 모집 수정 메뉴는 명령어를 실행한 사람만 사용할 수 있습니다.", ephemeral=True)
+        return False
+
+
 class RecruitmentCog(commands.Cog):
     """팀 빌딩과 참가 버튼 업데이트를 담당하는 Cog입니다."""
 
@@ -654,6 +816,31 @@ class RecruitmentCog(commands.Cog):
             (message_id,),
         )
 
+    async def edit_recruitment_message(self, channel_id: int, message_id: int) -> str | None:
+        """DB에 저장된 채널/메시지 ID로 기존 모집 Embed 메시지를 찾아 수정합니다."""
+        try:
+            channel = self.bot.get_channel(int(channel_id))
+            if channel is None:
+                channel = await self.bot.fetch_channel(int(channel_id))
+            if not hasattr(channel, "fetch_message"):
+                return "저장된 채널에서 모집 메시지를 가져올 수 없어 Discord 메시지는 수정하지 못했습니다."
+
+            # channel_id/message_id는 모집 생성 시 DB에 저장된 원본 메시지 위치입니다.
+            # fetch_message()로 Discord에 이미 올라간 메시지를 다시 가져온 뒤 edit()해야
+            # 참가/대기/불참 버튼이 붙은 실제 공개 모집글도 DB 수정 내용과 함께 갱신됩니다.
+            message = await channel.fetch_message(int(message_id))
+            embed = await self.build_recruitment_embed(int(message_id))
+            await message.edit(embed=embed, view=RecruitmentView(self))
+        except (TypeError, ValueError):
+            return "저장된 채널 또는 메시지 ID가 올바르지 않아 Discord 메시지는 수정하지 못했습니다."
+        except discord.NotFound:
+            return "기존 모집 메시지를 찾을 수 없어 DB만 수정했습니다."
+        except discord.Forbidden:
+            return "모집 메시지를 수정할 권한이 없어 DB만 수정했습니다."
+        except discord.HTTPException as exc:
+            return f"모집 메시지 수정 중 오류가 발생해 DB만 수정했습니다: {exc.text}"
+        return None
+
     async def get_vote_user_ids(self, recruitment_id: int, state: str) -> list[int]:
         """특정 상태에 투표한 유저 ID 목록을 가져옵니다."""
         rows = await self.bot.database.fetch_all(
@@ -696,6 +883,34 @@ class RecruitmentCog(commands.Cog):
     async def create_recruitment(self, interaction: discord.Interaction) -> None:
         """모집 생성 Modal을 엽니다."""
         await interaction.response.send_modal(RecruitmentModal(self))
+
+    @app_commands.command(name="모집수정", description="드롭다운 메뉴와 Modal로 모집 글을 수정합니다.")
+    async def edit_recruitment(self, interaction: discord.Interaction) -> None:
+        """내가 작성했거나 현재 모집 중인 글 최대 25개를 Select Menu로 보여줍니다."""
+        if interaction.guild is None:
+            await interaction.response.send_message("서버 안에서만 모집을 수정할 수 있습니다.", ephemeral=True)
+            return
+
+        rows = await self.bot.database.fetch_all(
+            """
+            SELECT id, title, target, max_members, status, author_id, channel_id, message_id FROM recruitments
+            WHERE guild_id = ? AND (author_id = ? OR status = ?)
+            ORDER BY created_at DESC
+            LIMIT 25
+            """,
+            (interaction.guild.id, interaction.user.id, STATUS_OPEN),
+        )
+
+        if not rows:
+            await interaction.response.send_message("수정할 모집 글이 없습니다.", ephemeral=True)
+            return
+
+        embed = base_embed(
+            "수정할 모집 글을 선택하세요",
+            "내가 작성했거나 현재 모집 중인 글이 최대 25개까지 표시됩니다.",
+            color=WARNING_COLOR,
+        )
+        await interaction.response.send_message(embed=embed, view=RecruitmentEditView(self, rows, interaction.user.id), ephemeral=True)
 
     @app_commands.command(name="모집생성", description="Gemini로 대회/해커톤 정보를 분석해 모집 글을 생성합니다.")
     @app_commands.describe(target_info="대회/해커톤 웹사이트 링크 또는 상세 텍스트")
