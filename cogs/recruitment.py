@@ -29,7 +29,7 @@ MAX_SCRAPED_TEXT_LENGTH = 5000
 MAX_RECRUITMENT_SOURCE_TEXT_LENGTH = 12000
 SCRAPING_ERROR_MESSAGE = "웹페이지 내용을 불러오지 못했습니다. 사이트 링크 대신 상세 텍스트를 직접 입력해 주세요."
 SCHEDULE_EXTRACTION_ERROR_MESSAGE = "일정 날짜를 자동 추출하지 못했습니다. 수동으로 등록해 주세요."
-SCHEDULE_EXTRACTION_MODEL = "gemini-2.5-flash"
+SCHEDULE_EXTRACTION_MODEL = "gemini-1.5-flash"
 SCHEDULE_EXTRACTION_PROMPT = """
 주어진 모집글 텍스트에서 해커톤/대회 일정을 분석하여 다음 JSON 스키마로만 응답해라.
 {
