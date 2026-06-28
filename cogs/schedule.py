@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 import discord
 from discord import app_commands
@@ -496,7 +496,7 @@ class ScheduleCog(commands.Cog):
         self,
         interaction: discord.Interaction,
         item: dict,
-    ) -> tuple[str, object] | None:
+    ) -> tuple[str, datetime, datetime] | None:
         """Gemini JSON 항목 하나를 검증한 뒤 DB에 등록합니다. 실패한 항목은 None으로 건너뜁니다."""
         if interaction.guild is None:
             return None
@@ -551,7 +551,7 @@ class ScheduleCog(commands.Cog):
                     (event_id, cursor.lastrowid),
                 )
 
-        return title[:100], starts_at
+        return title[:100], starts_at, ends_at
 
     @app_commands.command(name="일정", description="Team 0x34의 등록된 일정을 Embed로 확인합니다.")
     async def list_schedules(self, interaction: discord.Interaction) -> None:
@@ -675,7 +675,7 @@ class ScheduleCog(commands.Cog):
             await interaction.followup.send("Gemini API 호출 중 문제가 발생했습니다. API 키, 모델명, 할당량을 확인해 주세요.", ephemeral=True)
             return
 
-        registered: list[tuple[str, object]] = []
+        registered: list[tuple[str, datetime, datetime]] = []
         for item in items:
             result = await self.insert_generated_schedule(interaction, item)
             if result is None:
@@ -686,7 +686,14 @@ class ScheduleCog(commands.Cog):
             await interaction.followup.send("Gemini 응답에서 등록 가능한 일정을 찾지 못했습니다.", ephemeral=True)
             return
 
-        summary_lines = [f"- **{title}**: {format_discord_timestamp(starts_at)}" for title, starts_at in registered]
+        summary_lines: list[str] = []
+        for title, starts_at, ends_at in registered:
+            start_ts = int(starts_at.timestamp())
+            end_ts = int(ends_at.timestamp())
+            if starts_at == ends_at:
+                summary_lines.append(f"• **{title}**: <t:{start_ts}:F> (마감: <t:{start_ts}:R>)")
+            else:
+                summary_lines.append(f"• **{title}**: <t:{start_ts}:F> ~ <t:{end_ts}:F> (마감: <t:{end_ts}:R>)")
         embed = base_embed(
             f"✨ 총 {len(registered)}개의 일정이 자동 등록되었습니다!",
             "\n".join(summary_lines)[:4000],
