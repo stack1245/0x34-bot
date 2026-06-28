@@ -57,6 +57,23 @@ def build_schedule_generation_prompt() -> str:
 """.strip()
 
 
+def build_schedule_datetime_parse_prompt() -> str:
+    """수동 일정 추가 Modal의 자연어 날짜/시간을 Gemini가 JSON으로 변환하게 합니다."""
+    return f"""
+{get_current_time_context()}
+사용자가 입력한 자유 형식의 날짜/시간 텍스트를 분석하여 DB에 저장할 수 있는 정확한 시작 시간과 종료 시간으로 변환해라.
+본문에 연도가 생략되어 있다면 무조건 현재 연도를 사용하고, 절대로 지나간 과거 연도로 작성하지 마라.
+제목과 내용은 날짜/시간 해석을 위한 추가 문맥으로만 사용해라.
+반드시 아래 JSON 스키마의 객체 하나만 반환해라.
+{{
+    "start_time": "YYYY-MM-DD HH:MM:SS",
+    "end_time": "YYYY-MM-DD HH:MM:SS"
+}}
+종료 시간이 명확하지 않으면 end_time은 start_time과 동일하게 설정해라.
+날짜나 시간을 확정할 수 없으면 빈 문자열을 넣지 말고 JSON 파싱이 가능한 가장 엄격한 추론 결과를 반환해라.
+""".strip()
+
+
 class ScheduleModal(discord.ui.Modal, title="일정 추가"):
     """Slash Command에서 띄우는 입력 창입니다. Discord Modal은 짧은 폼 입력에 적합합니다."""
 
@@ -75,17 +92,27 @@ class ScheduleModal(discord.ui.Modal, title="일정 추가"):
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
         """사용자가 Modal을 제출하면 일정을 DB에 저장하고 필요하면 서버 이벤트도 만듭니다."""
+        await interaction.response.defer(ephemeral=True, thinking=True)
+
         if interaction.guild is None:
-            await interaction.response.send_message("서버 안에서만 일정을 추가할 수 있습니다.", ephemeral=True)
+            await interaction.followup.send("서버 안에서만 일정을 추가할 수 있습니다.", ephemeral=True)
             return
 
         try:
-            starts_at = parse_datetime(str(self.starts_at_input.value), self.cog.bot.settings.timezone)
-        except ValueError as exc:
-            await interaction.response.send_message(str(exc), ephemeral=True)
+            starts_at, ends_at = await self.cog.parse_manual_schedule_datetimes(
+                title=str(self.title_input.value),
+                date_text=str(self.starts_at_input.value),
+                body=str(self.body_input.value),
+            )
+        except Exception:
+            logging.exception("Gemini manual schedule datetime parsing failed")
+            await interaction.followup.send("⚠️ 날짜를 이해하지 못했습니다. 조금 더 명확하게 적어주세요.", ephemeral=True)
             return
 
-        await interaction.response.defer(ephemeral=True, thinking=True)
+        body = str(self.body_input.value).strip()
+        stored_body = body
+        if ends_at != starts_at:
+            stored_body = f"**종료** {format_discord_timestamp(ends_at)}\n{body}".strip()
 
         cursor = await self.cog.bot.database.execute(
             """
@@ -96,7 +123,7 @@ class ScheduleModal(discord.ui.Modal, title="일정 추가"):
                 interaction.guild.id,
                 str(self.title_input.value),
                 to_storage_iso(starts_at),
-                str(self.body_input.value),
+                stored_body,
                 interaction.user.id,
                 now_utc_iso(),
             ),
@@ -109,7 +136,8 @@ class ScheduleModal(discord.ui.Modal, title="일정 추가"):
                 interaction.guild,
                 str(self.title_input.value),
                 starts_at,
-                str(self.body_input.value),
+                body,
+                end_time=ends_at if ends_at > starts_at else None,
             )
 
         if event_id is not None:
@@ -120,10 +148,7 @@ class ScheduleModal(discord.ui.Modal, title="일정 추가"):
 
         await self.cog.update_schedule_board()
 
-        await interaction.followup.send(
-            f"일정이 등록되었습니다.\n- 시간: {format_discord_timestamp(starts_at)}\n- {event_status}",
-            ephemeral=True,
-        )
+        await interaction.followup.send(f"✅ 성공적으로 일정이 추가되었습니다.\n{event_status}", ephemeral=True)
 
 
 class ScheduleDeleteSelect(discord.ui.Select):
@@ -633,6 +658,65 @@ class ScheduleCog(commands.Cog):
             max_length=MAX_SCHEDULE_SOURCE_TEXT_LENGTH,
             logger=logging.getLogger(__name__),
         )
+
+    def parse_manual_schedule_datetime_payload(self, raw_text: str) -> tuple[datetime, datetime]:
+        """Gemini가 반환한 start_time/end_time JSON을 datetime으로 변환하고 과거 연도를 보정합니다."""
+        text = raw_text.strip()
+        if text.startswith("```"):
+            text = text.strip("`")
+            text = text.removeprefix("json").strip()
+
+        try:
+            payload = json.loads(text)
+        except json.JSONDecodeError:
+            object_text = text[text.find("{") : text.rfind("}") + 1]
+            payload = json.loads(object_text)
+
+        if not isinstance(payload, dict):
+            raise ValueError("Gemini datetime payload must be a JSON object")
+
+        start_text = str(payload.get("start_time") or "").strip()
+        end_text = str(payload.get("end_time") or start_text).strip()
+        if not start_text or not end_text:
+            raise ValueError("Gemini datetime payload is missing start_time or end_time")
+
+        starts_at = fix_past_year(parse_datetime(start_text, self.bot.settings.timezone))
+        ends_at = fix_past_year(parse_datetime(end_text, self.bot.settings.timezone))
+        if ends_at < starts_at:
+            raise ValueError("Gemini datetime payload has end_time before start_time")
+        return starts_at, ends_at
+
+    def generate_manual_schedule_datetime_json_sync(self, *, title: str, date_text: str, body: str) -> str:
+        """수동 일정 Modal의 자유 형식 날짜/시간을 Gemini JSON 응답으로 변환합니다."""
+        if self.bot.settings.gemini_api_key is None:
+            raise RuntimeError("GEMINI_API_KEY가 설정되어 있지 않습니다. .env 또는 Railway Variables에 추가해 주세요.")
+
+        genai.configure(api_key=self.bot.settings.gemini_api_key)
+        model = genai.GenerativeModel(
+            model_name=self.bot.settings.gemini_model,
+            system_instruction=build_schedule_datetime_parse_prompt(),
+        )
+        response = model.generate_content(
+            "다음 수동 일정 입력에서 날짜/시간을 해석해 start_time과 end_time JSON으로 변환해 주세요.\n\n"
+            f"제목: {title}\n"
+            f"날짜/시간 입력: {date_text}\n"
+            f"내용: {body}",
+            generation_config={
+                "temperature": 0.1,
+                "response_mime_type": "application/json",
+            },
+        )
+        return str(getattr(response, "text", "") or "")
+
+    async def parse_manual_schedule_datetimes(self, *, title: str, date_text: str, body: str) -> tuple[datetime, datetime]:
+        """Gemini 호출을 백그라운드 스레드에서 실행하고 수동 일정 날짜 범위를 반환합니다."""
+        raw_text = await asyncio.to_thread(
+            self.generate_manual_schedule_datetime_json_sync,
+            title=title,
+            date_text=date_text,
+            body=body,
+        )
+        return self.parse_manual_schedule_datetime_payload(raw_text)
 
     async def insert_generated_schedule(
         self,
