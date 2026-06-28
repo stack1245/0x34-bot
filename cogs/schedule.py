@@ -8,6 +8,7 @@ from datetime import datetime, timedelta
 import discord
 from discord import app_commands
 from discord.ext import commands
+from google.api_core import exceptions
 import google.generativeai as genai
 
 from utils.ai_input import CONVERSATIONAL_INPUT_INSTRUCTION, ScrapingError, prepare_conversational_source_text
@@ -25,6 +26,7 @@ from utils.embeds import SUCCESS_COLOR, WARNING_COLOR, base_embed
 
 MAX_SCHEDULE_SOURCE_TEXT_LENGTH = 12000
 SCRAPING_ERROR_MESSAGE = "웹페이지 내용을 불러오지 못했습니다. 사이트 링크 대신 상세 텍스트를 직접 입력해 주세요."
+GEMINI_RATE_LIMIT_MESSAGE = "⚠️ 봇이 너무 많은 요청을 처리하고 있습니다. 1분 뒤에 다시 시도해 주세요."
 SCHEDULE_BOARD_STATE_KEY = "schedule_board"
 
 
@@ -104,6 +106,9 @@ class ScheduleModal(discord.ui.Modal, title="일정 추가"):
                 date_text=str(self.starts_at_input.value),
                 body=str(self.body_input.value),
             )
+        except exceptions.ResourceExhausted:
+            await interaction.followup.send(GEMINI_RATE_LIMIT_MESSAGE, ephemeral=True)
+            return
         except Exception:
             logging.exception("Gemini manual schedule datetime parsing failed")
             await interaction.followup.send("⚠️ 날짜를 이해하지 못했습니다. 조금 더 명확하게 적어주세요.", ephemeral=True)
@@ -891,6 +896,9 @@ class ScheduleCog(commands.Cog):
         try:
             source_text = await self.prepare_schedule_source_text(target_info)
             items = await self.generate_schedule_items(source_text)
+        except exceptions.ResourceExhausted:
+            await interaction.followup.send(GEMINI_RATE_LIMIT_MESSAGE, ephemeral=True)
+            return
         except ScrapingError:
             await interaction.followup.send(SCRAPING_ERROR_MESSAGE, ephemeral=True)
             return

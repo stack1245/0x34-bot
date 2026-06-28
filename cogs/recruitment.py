@@ -8,6 +8,7 @@ import re
 import discord
 from discord import app_commands
 from discord.ext import commands
+from google.api_core import exceptions
 import google.generativeai as genai
 
 from utils.ai_input import (
@@ -30,6 +31,7 @@ MAX_AI_TITLE_LENGTH = 50
 MAX_EMBED_DESCRIPTION_LENGTH = 3900
 MAX_RECRUITMENT_SOURCE_TEXT_LENGTH = 12000
 SCRAPING_ERROR_MESSAGE = "웹페이지 내용을 불러오지 못했습니다. 사이트 링크 대신 상세 텍스트를 직접 입력해 주세요."
+GEMINI_RATE_LIMIT_MESSAGE = "⚠️ 봇이 너무 많은 요청을 처리하고 있습니다. 1분 뒤에 다시 시도해 주세요."
 
 
 GEMINI_SYSTEM_PROMPT = """
@@ -828,6 +830,9 @@ class RecruitmentCog(commands.Cog):
 
         try:
             title, description, max_members = await self.generate_recruitment_copy(source_text)
+        except exceptions.ResourceExhausted:
+            await interaction.followup.send(GEMINI_RATE_LIMIT_MESSAGE, ephemeral=True)
+            return
         except RuntimeError as exc:
             await interaction.followup.send(str(exc), ephemeral=True)
             return
