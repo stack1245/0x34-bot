@@ -37,7 +37,11 @@ SCHEDULE_EXTRACTION_PROMPT = """
     "end_time": "YYYY-MM-DD HH:MM:SS 형식의 종료 시간 (없으면 시작 시간과 동일하게)",
     "location": "온라인 또는 오프라인 장소"
 }
+대회 일정에 '참가 신청(접수)' 기간과 실제 '대회(예선/본선)' 일정이 섞여 있다면, 참가 신청 기간은 무시하고 실제 대회가 시작되는 '예선' 또는 '본선' 날짜를 기준으로 작성해라.
+예선과 본선이 모두 있다면 예선 시작 시간을 start_time으로, 본선 종료 시간이 명확하면 end_time으로 사용해라.
+시간 정보는 무조건 YYYY-MM-DD HH:MM:SS 형식이어야 한다. 시간이 없다면 00:00:00으로 고정하고, 절대 다른 텍스트(예: ~, KST, 예정, 부터, 까지)를 덧붙이지 마라.
 날짜나 시간이 명확하지 않으면 추측하지 말고 빈 JSON 객체 {}를 반환해라.
+응답은 반드시 JSON 객체 하나로만 작성하고, 마크다운 코드블록이나 설명 문장을 포함하지 마라.
 """.strip()
 URL_PATTERN = re.compile(r"https?://[^\s<>()]+", re.IGNORECASE)
 URL_TRAILING_PUNCTUATION = ".,;:!?)]}>'\""
@@ -245,21 +249,31 @@ def parse_gemini_schedule_payload(raw_text: str, timezone_name: str) -> tuple[da
     try:
         payload = json.loads(cleaned)
     except json.JSONDecodeError as exc:
+        logging.exception("Gemini schedule JSON parsing failed. raw_response=%r cleaned_response=%r", raw_text, cleaned)
         raise ScheduleExtractionError("Gemini schedule response is not valid JSON") from exc
 
     if not isinstance(payload, dict):
+        logging.error("Gemini schedule response is not a JSON object. raw_response=%r parsed_payload=%r", raw_text, payload)
         raise ScheduleExtractionError("Gemini schedule response is not a JSON object")
 
     start_time = str(payload.get("start_time", "")).strip()
     end_time = str(payload.get("end_time", "")).strip() or start_time
     location = str(payload.get("location", "온라인")).strip() or "온라인"
     if not start_time:
+        logging.error("Gemini schedule response is missing start_time. raw_response=%r parsed_payload=%r", raw_text, payload)
         raise ScheduleExtractionError("start_time is missing")
 
     try:
         starts_at = parse_datetime(start_time, timezone_name)
         ends_at = parse_datetime(end_time, timezone_name)
     except ValueError as exc:
+        logging.exception(
+            "Gemini schedule datetime parsing failed. raw_response=%r start_time=%r end_time=%r location=%r",
+            raw_text,
+            start_time,
+            end_time,
+            location,
+        )
         raise ScheduleExtractionError("invalid schedule datetime format") from exc
 
     return starts_at, ends_at, location
@@ -506,7 +520,11 @@ class RecruitmentCog(commands.Cog):
         """Embed 제목/본문을 Gemini에 보내 일정 정보를 datetime으로 파싱합니다."""
         source_text = f"제목: {title}\n\n본문:\n{description}"
         raw_text = await asyncio.to_thread(self._extract_schedule_payload_sync, source_text)
-        return parse_gemini_schedule_payload(raw_text, self.bot.settings.timezone)
+        try:
+            return parse_gemini_schedule_payload(raw_text, self.bot.settings.timezone)
+        except ScheduleExtractionError:
+            logging.exception("Failed to extract schedule from Gemini response. raw_response=%r", raw_text)
+            raise
 
     async def create_recruitment_scheduled_event(
         self,
