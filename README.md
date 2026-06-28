@@ -59,3 +59,22 @@ API 키는 코드나 Git에 커밋하지 말고 환경 변수로만 관리하세
 - `/대회등록`: Modal로 대회 정보를 받아 알림 채널에 Embed를 전송합니다. 민감 정보 메모는 작성자에게만 Ephemeral 응답으로 보여줍니다.
 - `/모집`: Modal로 모집 글을 만들고 `[참가]`, `[불참]`, `[대기]`, `[모집 마감]` 버튼으로 실시간 참가자 목록을 관리합니다.
 - `/모집생성`: Gemini가 링크나 상세 텍스트를 분석해 모집 Embed를 만들고 동일한 참가 버튼을 붙입니다.
+
+## Slash Command 초기화
+
+고스트 커맨드가 쌓이면 `.env` 또는 Railway Variables에서 아래 값을 켠 뒤 봇을 재시작하세요.
+
+```env
+SYNC_COMMANDS=true
+CLEAR_COMMANDS_ON_START=true
+```
+
+`GUILD_ID`가 설정되어 있으면 전역 명령과 해당 테스트 서버 명령을 먼저 비운 뒤 서버 명령을 빠르게 재등록합니다. `GUILD_ID`가 비어 있으면 전역 명령을 비운 뒤 전역 명령으로 재등록합니다. 전역 명령은 Discord 정책상 반영에 최대 1시간이 걸릴 수 있으므로 개발 중에는 `GUILD_ID`를 넣고 서버 단위로 테스트하는 편이 좋습니다.
+
+슬래시 커맨드가 아예 보이지 않는 상황을 대비해 봇 소유자 전용 텍스트 명령도 선택적으로 켤 수 있습니다.
+
+```env
+ENABLE_ADMIN_TEXT_COMMANDS=true
+```
+
+이 경우 Discord Developer Portal에서 Message Content Intent를 활성화해야 하며, 서버 채널에서 `!인증 sync guild`, `!인증 sync global`, `!인증 clear all`처럼 사용할 수 있습니다.

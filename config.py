@@ -36,6 +36,8 @@ class Settings:
     gemini_model: str
     enable_server_events: bool
     sync_commands: bool
+    clear_commands_on_start: bool
+    enable_admin_text_commands: bool
 
 
 def load_settings() -> Settings:
@@ -58,4 +60,6 @@ def load_settings() -> Settings:
         gemini_model=os.getenv("GEMINI_MODEL", "gemini-2.5-flash"),
         enable_server_events=_env_flag("ENABLE_SERVER_EVENTS", True),
         sync_commands=_env_flag("SYNC_COMMANDS", True),
+        clear_commands_on_start=_env_flag("CLEAR_COMMANDS_ON_START", False),
+        enable_admin_text_commands=_env_flag("ENABLE_ADMIN_TEXT_COMMANDS", False),
     )
