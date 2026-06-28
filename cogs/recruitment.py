@@ -32,10 +32,14 @@ URL_TRAILING_PUNCTUATION = ".,;:!?)]}>'\""
 
 
 GEMINI_SYSTEM_PROMPT = """
-1. 제목은 이모지를 포함해 50자 이내로 직관적으로 작성해라.
-2. 본문은 대회 일정, 참가 자격, 주제, 혜택을 디스코드 마크다운(볼드, 불릿 등)을 활용해 깔끔하게 요약해라.
-3. 텍스트에 없는 내용은 추측하지 말고, 확인할 수 없는 항목은 "공개된 정보 없음"이라고 적어라.
-4. 응답은 반드시 JSON 객체 하나로만 작성해라. 형식은 {"title": "제목", "description": "본문"} 이다.
+주어진 해커톤/대회 웹사이트 텍스트를 분석하여 다음 JSON 스키마에 맞게 결과를 반환해라.
+{
+    "title": "이모지를 포함한 50자 이내의 모집 제목",
+    "description": "마크다운을 활용한 대회 일정, 참가 자격, 주제, 혜택 요약글",
+    "max_members": "본문에 명시된 최대 팀원 수 (정수형). 명시되어 있지 않으면 4로 설정"
+}
+텍스트에 없는 내용은 추측하지 말고, 확인할 수 없는 항목은 "공개된 정보 없음"이라고 적어라.
+응답은 반드시 JSON 객체 하나로만 작성해라.
 """.strip()
 
 
@@ -155,15 +159,41 @@ def _clean_title(value: str) -> str:
     return _trim_text(title, MAX_AI_TITLE_LENGTH)
 
 
-def parse_gemini_recruitment(raw_text: str, fallback_source: str) -> tuple[str, str]:
+def _parse_max_members(value: object) -> int:
+    """Gemini JSON의 max_members를 안전하게 정수로 바꾸고 실패하면 기본값 4를 사용합니다."""
+    try:
+        if isinstance(value, bool):
+            raise ValueError("bool is not a valid max_members")
+        if isinstance(value, int):
+            parsed = value
+        elif isinstance(value, float):
+            parsed = int(value)
+        elif isinstance(value, str):
+            match = re.search(r"\d+", value)
+            if match is None:
+                raise ValueError("no integer in max_members string")
+            parsed = int(match.group(0))
+        else:
+            raise ValueError("unsupported max_members type")
+    except (TypeError, ValueError):
+        return DEFAULT_AI_RECRUITMENT_CAPACITY
+
+    if parsed < 0:
+        return DEFAULT_AI_RECRUITMENT_CAPACITY
+    return parsed
+
+
+def parse_gemini_recruitment(raw_text: str, fallback_source: str) -> tuple[str, str, int]:
     """Gemini 응답을 모집 Embed에 넣을 제목과 본문으로 변환합니다.
 
     모델에는 JSON만 반환하라고 지시하지만, 실제 LLM 응답은 코드블록이나 일반 텍스트가 섞일 수 있습니다.
-    그래서 JSON 파싱을 먼저 시도하고, 실패하면 첫 줄을 제목, 나머지를 본문으로 쓰는 fallback을 둡니다.
+    그래서 json.loads를 먼저 시도하고, 실패하면 첫 줄을 제목, 나머지를 본문으로 쓰는 fallback을 둡니다.
+    max_members는 JSON 파싱 실패나 값 오류가 있어도 기본값 4로 안전하게 보정합니다.
     """
     cleaned = _strip_json_code_fence(raw_text)
     title = ""
     description = ""
+    max_members = DEFAULT_AI_RECRUITMENT_CAPACITY
 
     try:
         payload = json.loads(cleaned)
@@ -180,6 +210,7 @@ def parse_gemini_recruitment(raw_text: str, fallback_source: str) -> tuple[str, 
     if isinstance(payload, dict):
         title = str(payload.get("title", ""))
         description = str(payload.get("description", ""))
+        max_members = _parse_max_members(payload.get("max_members", DEFAULT_AI_RECRUITMENT_CAPACITY))
 
     if not title or not description:
         lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
@@ -189,7 +220,7 @@ def parse_gemini_recruitment(raw_text: str, fallback_source: str) -> tuple[str, 
 
     title = _clean_title(title) or "🚀 Team 0x34 모집"
     description = description.strip() or f"**대상 정보**\n- {fallback_source}"
-    return title, _trim_text(description, MAX_EMBED_DESCRIPTION_LENGTH)
+    return title, _trim_text(description, MAX_EMBED_DESCRIPTION_LENGTH), max_members
 
 
 class RecruitmentView(discord.ui.View):
@@ -580,7 +611,7 @@ class RecruitmentCog(commands.Cog):
         )
         return str(getattr(response, "text", "") or "")
 
-    async def generate_recruitment_copy(self, source_text: str) -> tuple[str, str]:
+    async def generate_recruitment_copy(self, source_text: str) -> tuple[str, str, int]:
         """Gemini 호출을 백그라운드 스레드로 넘기고, 응답을 Embed용 데이터로 파싱합니다."""
         raw_text = await asyncio.to_thread(self._generate_recruitment_copy_sync, source_text)
         return parse_gemini_recruitment(raw_text, source_text)
@@ -690,7 +721,7 @@ class RecruitmentCog(commands.Cog):
             return
 
         try:
-            title, description = await self.generate_recruitment_copy(source_text)
+            title, description, max_members = await self.generate_recruitment_copy(source_text)
         except RuntimeError as exc:
             await interaction.followup.send(str(exc), ephemeral=True)
             return
@@ -703,7 +734,7 @@ class RecruitmentCog(commands.Cog):
             interaction,
             title=title,
             target=description,
-            max_members=DEFAULT_AI_RECRUITMENT_CAPACITY,
+            max_members=max_members,
             use_deferred_response=True,
         )
 
