@@ -1,11 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import discord
 from discord import app_commands
-from discord.ext import commands
+from discord.ext import commands, tasks
+
+
+KST = ZoneInfo("Asia/Seoul")
 
 
 class MaintenanceCog(commands.Cog):
@@ -13,6 +19,15 @@ class MaintenanceCog(commands.Cog):
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+
+    async def cog_load(self) -> None:
+        """Cog가 로드될 때 만료 일정 자동 청소 루프를 시작합니다."""
+        if not self.auto_cleanup_past_schedules.is_running():
+            self.auto_cleanup_past_schedules.start()
+
+    async def cog_unload(self) -> None:
+        """Cog가 언로드될 때 백그라운드 루프를 안전하게 중단합니다."""
+        self.auto_cleanup_past_schedules.cancel()
 
     def get_database_path(self) -> Path:
         """설정에서 실제 SQLite DB 파일 경로를 안전하게 가져옵니다.
@@ -168,6 +183,59 @@ class MaintenanceCog(commands.Cog):
             await asyncio.sleep(0.5)
 
         return deleted_count
+
+    def parse_schedule_datetime(self, value: str) -> datetime | None:
+        """DB에 저장된 ISO 날짜 문자열을 KST 기준 datetime으로 안전하게 파싱합니다."""
+        try:
+            parsed = datetime.fromisoformat(value)
+        except (TypeError, ValueError):
+            return None
+
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(KST)
+
+    async def delete_past_schedules(self) -> int:
+        """현재 한국 시간보다 과거인 일정을 DB에서 삭제합니다."""
+        now = datetime.now(KST)
+        rows = await self.bot.database.fetch_all("SELECT id, starts_at FROM schedules")
+        expired_ids: list[int] = []
+
+        for row in rows:
+            starts_at = self.parse_schedule_datetime(row["starts_at"])
+            if starts_at is None:
+                logging.info("[Maintenance] 일정 %s의 날짜 형식을 파싱할 수 없어 자동 삭제를 건너뜁니다.", row["id"])
+                continue
+            if starts_at < now:
+                expired_ids.append(int(row["id"]))
+
+        if not expired_ids:
+            return 0
+
+        placeholders = ",".join("?" for _ in expired_ids)
+        await self.bot.database.execute(
+            f"DELETE FROM schedules WHERE id IN ({placeholders})",
+            expired_ids,
+        )
+        return len(expired_ids)
+
+    @tasks.loop(hours=24)
+    async def auto_cleanup_past_schedules(self) -> None:
+        """매일 한 번 만료된 일정을 자동 삭제합니다."""
+        deleted_count = await self.delete_past_schedules()
+        if deleted_count:
+            logging.info("[Maintenance] %s개의 만료된 일정을 자동 삭제했습니다.", deleted_count)
+
+    @auto_cleanup_past_schedules.before_loop
+    async def before_auto_cleanup_past_schedules(self) -> None:
+        """봇 연결과 DB 초기화가 끝난 뒤 백그라운드 루프가 돌도록 대기합니다."""
+        try:
+            await self.bot.wait_until_ready()
+        except RuntimeError:
+            # 테스트나 도구 실행처럼 Discord 로그인 없이 Cog만 로드한 경우에는
+            # wait_until_ready()가 실패합니다. 운영 봇에서는 로그인 후 정상 대기하며,
+            # 오프라인 로딩에서는 첫 실행 전에 루프를 멈춰 불필요한 예외를 막습니다.
+            self.auto_cleanup_past_schedules.stop()
 
     @app_commands.command(name="db정리", description="관리자 전용: 백업 후 삭제된 Discord 객체의 DB 고아 데이터를 정리합니다.")
     @app_commands.default_permissions(administrator=True)
