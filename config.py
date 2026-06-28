@@ -13,6 +13,15 @@ def _optional_int(value: str | None) -> int | None:
     return int(value)
 
 
+def _env_value(*names: str, default: str) -> str:
+    """여러 환경 변수 이름을 우선순위대로 읽고, 모두 비어 있으면 기본값을 사용합니다."""
+    for name in names:
+        value = os.getenv(name, "").strip()
+        if value:
+            return value
+    return default
+
+
 def _env_flag(name: str, default: bool) -> bool:
     """Railway Variables처럼 문자열로 들어오는 true/false 값을 bool로 바꿉니다."""
     value = os.getenv(name)
@@ -51,7 +60,7 @@ def load_settings() -> Settings:
     return Settings(
         token=token,
         guild_id=_optional_int(os.getenv("GUILD_ID")),
-        database_path=os.getenv("DATABASE_PATH", "data/0x34.sqlite3"),
+        database_path=_env_value("DB_PATH", "DATABASE_PATH", default="data/0x34.sqlite3"),
         timezone=os.getenv("TIMEZONE", "Asia/Seoul"),
         schedule_channel_id=_optional_int(os.getenv("SCHEDULE_CHANNEL_ID")),
         tournament_channel_id=_optional_int(os.getenv("TOURNAMENT_CHANNEL_ID")),
