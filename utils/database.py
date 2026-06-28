@@ -43,6 +43,7 @@ SCHEMA: tuple[str, ...] = (
         target TEXT NOT NULL,
         max_members INTEGER NOT NULL,
         status TEXT NOT NULL,
+        thread_id INTEGER,
         created_at TEXT NOT NULL,
         closed_at TEXT
     )
@@ -81,7 +82,16 @@ class Database:
 
         for statement in SCHEMA:
             await self.connection.execute(statement)
+        await self._run_migrations()
         await self.connection.commit()
+
+    async def _run_migrations(self) -> None:
+        """이미 만들어진 SQLite DB에도 새 컬럼을 안전하게 추가합니다."""
+        connection = self._require_connection()
+        cursor = await connection.execute("PRAGMA table_info(recruitments)")
+        columns = {row[1] for row in await cursor.fetchall()}
+        if "thread_id" not in columns:
+            await connection.execute("ALTER TABLE recruitments ADD COLUMN thread_id INTEGER")
 
     async def close(self) -> None:
         """봇 종료 시 DB 연결을 닫습니다."""

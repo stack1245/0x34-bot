@@ -133,9 +133,14 @@ class RecruitmentView(discord.ui.View):
             (recruitment["id"], interaction.user.id, state, now_utc_iso()),
         )
 
+        thread_notice = await self.cog.sync_private_thread_membership(recruitment, interaction.user, state)
         embed = await self.cog.build_recruitment_embed(recruitment["message_id"])
         await interaction.message.edit(embed=embed, view=self)
-        await interaction.response.send_message("응답이 반영되었습니다.", ephemeral=True)
+
+        response = "응답이 반영되었습니다."
+        if thread_notice:
+            response += f"\n{thread_notice}"
+        await interaction.response.send_message(response, ephemeral=True)
 
     @discord.ui.button(label="참가", style=discord.ButtonStyle.success, custom_id="0x34:recruitment:join")
     async def join(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -179,18 +184,23 @@ class RecruitmentView(discord.ui.View):
         embed = await self.cog.build_recruitment_embed(recruitment["message_id"])
         await interaction.message.edit(embed=embed, view=self)
 
+        thread, thread_notice = await self.cog.ensure_private_workspace_thread(recruitment, interaction, interaction.message)
         joined = await self.cog.get_vote_user_ids(recruitment["id"], STATE_JOIN)
-        waiting = await self.cog.get_vote_user_ids(recruitment["id"], STATE_WAIT)
-        mentions = " ".join(f"<@{user_id}>" for user_id in [*joined, *waiting]) or "참가자가 없습니다."
+        mentions = " ".join(f"<@{user_id}>" for user_id in joined) or "참가자가 없습니다."
 
-        thread_message = f"모집이 마감되었습니다.\n참가/대기 인원: {mentions}"
-        try:
-            thread = await interaction.message.create_thread(name=f"{recruitment['title']} 준비", auto_archive_duration=1440)
-            await thread.send(thread_message)
-            await interaction.followup.send(f"모집을 마감하고 스레드를 만들었습니다: {thread.mention}", ephemeral=True)
-        except discord.HTTPException:
-            await interaction.channel.send(thread_message)  # type: ignore[union-attr]
-            await interaction.followup.send("모집을 마감했습니다. 스레드 생성은 실패해 현재 채널에 멘션했습니다.", ephemeral=True)
+        if thread is None:
+            await interaction.followup.send(
+                "모집은 마감했지만 비공개 스레드를 사용할 수 없어 참가자 멘션은 공개 채널에 보내지 않았습니다.\n"
+                f"{thread_notice or '채널 권한과 서버 부스트 레벨을 확인해 주세요.'}",
+                ephemeral=True,
+            )
+            return
+
+        for user_id in joined:
+            await self.cog.add_user_to_private_thread(thread, discord.Object(id=user_id))
+
+        await thread.send(f"모집이 마감되었습니다.\n참가 인원: {mentions}")
+        await interaction.followup.send(f"모집을 마감하고 비공개 워크스페이스에 참가자를 안내했습니다: {thread.mention}", ephemeral=True)
 
 
 class RecruitmentModal(discord.ui.Modal, title="팀원 모집"):
@@ -225,14 +235,17 @@ class RecruitmentModal(discord.ui.Modal, title="팀원 모집"):
             return
 
         await interaction.response.defer(ephemeral=True, thinking=True)
-        message, _ = await self.cog.post_recruitment_message(
+        message, _, thread_notice = await self.cog.post_recruitment_message(
             interaction,
             title=str(self.title_input.value),
             target=str(self.target_input.value),
             max_members=max_members,
             use_deferred_response=False,
         )
-        await interaction.followup.send(f"모집 글을 만들었습니다: {message.jump_url}", ephemeral=True)
+        response = f"모집 글을 만들었습니다: {message.jump_url}"
+        if thread_notice:
+            response += f"\n{thread_notice}"
+        await interaction.followup.send(response, ephemeral=True)
 
 
 class RecruitmentCog(commands.Cog):
@@ -264,7 +277,7 @@ class RecruitmentCog(commands.Cog):
         target: str,
         max_members: int,
         use_deferred_response: bool,
-    ) -> tuple[discord.Message, bool]:
+    ) -> tuple[discord.Message, bool, str | None]:
         """DB 저장과 버튼 달린 모집 메시지 생성을 한 곳에서 처리합니다.
 
         `/모집`과 `/모집생성`이 같은 테이블, 같은 Embed 빌더, 같은 Persistent View를 사용해야
@@ -289,10 +302,10 @@ class RecruitmentCog(commands.Cog):
         else:
             message = await channel.send(embed=placeholder, view=view)
 
-        await self.bot.database.execute(
+        cursor = await self.bot.database.execute(
             """
-            INSERT INTO recruitments (guild_id, channel_id, message_id, author_id, title, target, max_members, status, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT INTO recruitments (guild_id, channel_id, message_id, author_id, title, target, max_members, status, thread_id, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 interaction.guild.id,
@@ -303,13 +316,145 @@ class RecruitmentCog(commands.Cog):
                 target,
                 max_members,
                 STATUS_OPEN,
+                None,
                 now_utc_iso(),
             ),
         )
 
+        thread, thread_notice = await self.create_private_workspace_thread(interaction, channel, title, message)
+        if thread is not None:
+            await self.bot.database.execute(
+                "UPDATE recruitments SET thread_id = ? WHERE id = ?",
+                (thread.id, cursor.lastrowid),
+            )
+
         embed = await self.build_recruitment_embed(message.id)
         await message.edit(embed=embed, view=RecruitmentView(self))
-        return message, should_use_followup
+        if thread_notice:
+            logging.info("Private recruitment thread notice for message %s: %s", message.id, thread_notice)
+        return message, should_use_followup, thread_notice
+
+    async def create_private_workspace_thread(
+        self,
+        interaction: discord.Interaction,
+        channel: discord.abc.Messageable,
+        title: str,
+        source_message: discord.Message,
+    ) -> tuple[discord.Thread | None, str | None]:
+        """모집 전용 비공개 스레드를 만들고 작성자를 즉시 초대합니다.
+
+        비공개 스레드를 만들려면 봇이 해당 텍스트 채널에서 `Create Private Threads`와
+        `Send Messages in Threads` 권한을 가져야 합니다. 서버 설정이나 채널 오버라이드에 따라
+        멤버 초대/아카이브된 스레드 관리를 위해 `Manage Threads` 권한이 추가로 필요할 수 있습니다.
+        또한 Discord 정책상 일부 서버 기능은 부스트 레벨 2 이상에서만 안정적으로 사용할 수 있습니다.
+        """
+        if not isinstance(channel, discord.TextChannel):
+            return None, "비공개 스레드는 일반 텍스트 채널에서만 생성할 수 있습니다."
+
+        thread_name = _trim_text(f"{title} 워크스페이스", 90)
+        try:
+            thread = await channel.create_thread(
+                name=thread_name,
+                type=discord.ChannelType.private_thread,
+                auto_archive_duration=1440,
+                invitable=False,
+                reason="Team 0x34 private recruitment workspace",
+            )
+        except discord.Forbidden:
+            return None, "봇에게 비공개 스레드 생성 권한이 없습니다. Create Private Threads, Send Messages in Threads, Manage Threads 권한을 확인해 주세요."
+        except discord.HTTPException as exc:
+            return None, f"비공개 스레드 생성에 실패했습니다. 서버 부스트 레벨 또는 Discord API 제한을 확인해 주세요: {exc.text}"
+
+        author_notice = await self.add_user_to_private_thread(thread, interaction.user)
+        intro_embed = base_embed(
+            "Team 0x34 비공개 워크스페이스",
+            "Team 0x34의 비공개 워크스페이스가 생성되었습니다.",
+            color=SUCCESS_COLOR,
+        )
+        intro_embed.add_field(name="모집 글", value=source_message.jump_url, inline=False)
+        intro_embed.add_field(name="접근 안내", value="작성자와 [참가]를 누른 팀원만 이 스레드에 초대됩니다.", inline=False)
+
+        try:
+            await thread.send(embed=intro_embed)
+        except discord.HTTPException as exc:
+            return thread, f"비공개 스레드는 만들었지만 안내 Embed 전송에 실패했습니다: {exc.text}"
+
+        return thread, author_notice
+
+    async def ensure_private_workspace_thread(
+        self,
+        recruitment,
+        interaction: discord.Interaction,
+        source_message: discord.Message,
+    ) -> tuple[discord.Thread | None, str | None]:
+        """기존 비공개 스레드를 찾고, 없으면 새로 만들어 DB에 저장합니다."""
+        thread_id = recruitment["thread_id"]
+        if thread_id is not None:
+            thread = await self.fetch_private_thread(int(thread_id))
+            if thread is not None:
+                return thread, await self.add_user_to_private_thread(thread, interaction.user)
+
+        thread, notice = await self.create_private_workspace_thread(interaction, source_message.channel, recruitment["title"], source_message)
+        if thread is not None:
+            await self.bot.database.execute(
+                "UPDATE recruitments SET thread_id = ? WHERE id = ?",
+                (thread.id, recruitment["id"]),
+            )
+        return thread, notice
+
+    async def fetch_private_thread(self, thread_id: int) -> discord.Thread | None:
+        """저장된 스레드 ID로 Thread 객체를 가져옵니다."""
+        channel = self.bot.get_channel(thread_id)
+        if isinstance(channel, discord.Thread):
+            return channel
+
+        try:
+            fetched = await self.bot.fetch_channel(thread_id)
+        except (discord.Forbidden, discord.NotFound, discord.HTTPException):
+            return None
+        if isinstance(fetched, discord.Thread):
+            return fetched
+        return None
+
+    async def add_user_to_private_thread(self, thread: discord.Thread, user: discord.abc.Snowflake) -> str | None:
+        """비공개 스레드에 사용자를 초대하고 실패 사유를 사용자에게 보여줄 문구로 반환합니다."""
+        try:
+            await thread.add_user(user)
+        except discord.Forbidden:
+            return "비공개 스레드 초대 권한이 없어 워크스페이스에 자동 초대하지 못했습니다. Manage Threads 권한을 확인해 주세요."
+        except discord.HTTPException as exc:
+            return f"비공개 스레드 초대에 실패했습니다: {exc.text}"
+        return None
+
+    async def remove_user_from_private_thread(self, thread: discord.Thread, user: discord.abc.Snowflake) -> str | None:
+        """참가를 취소한 사용자가 비공개 워크스페이스에 계속 남지 않도록 제거합니다."""
+        try:
+            await thread.remove_user(user)
+        except discord.Forbidden:
+            return "비공개 스레드에서 사용자를 제거할 권한이 없습니다. Manage Threads 권한을 확인해 주세요."
+        except discord.NotFound:
+            return None
+        except discord.HTTPException as exc:
+            return f"비공개 스레드 멤버 제거에 실패했습니다: {exc.text}"
+        return None
+
+    async def sync_private_thread_membership(self, recruitment, user: discord.abc.Snowflake, state: str) -> str | None:
+        """참가 버튼 상태와 비공개 스레드 멤버십을 맞춥니다."""
+        thread_id = recruitment["thread_id"]
+        if thread_id is None:
+            return "비공개 워크스페이스가 아직 없어 스레드 초대는 건너뛰었습니다."
+
+        thread = await self.fetch_private_thread(int(thread_id))
+        if thread is None:
+            return "저장된 비공개 워크스페이스를 찾을 수 없습니다. 작성자가 모집 마감 시 다시 생성할 수 있습니다."
+
+        if state == STATE_JOIN:
+            notice = await self.add_user_to_private_thread(thread, user)
+            return notice or f"비공개 워크스페이스에 초대했습니다: {thread.mention}"
+
+        if user.id == recruitment["author_id"]:
+            return None
+        return await self.remove_user_from_private_thread(thread, user)
 
     def _generate_recruitment_copy_sync(self, target_info: str) -> str:
         """Gemini SDK의 동기 API를 호출합니다.
@@ -378,6 +523,8 @@ class RecruitmentCog(commands.Cog):
         embed.add_field(name="상태", value=status_text, inline=True)
         embed.add_field(name="정원", value=capacity, inline=True)
         embed.add_field(name="작성자", value=f"<@{recruitment['author_id']}>", inline=True)
+        if recruitment["thread_id"]:
+            embed.add_field(name="비공개 워크스페이스", value=f"<#{recruitment['thread_id']}>", inline=False)
         embed.add_field(name="참가", value=mention_list(joined), inline=False)
         embed.add_field(name="대기", value=mention_list(waiting), inline=False)
         embed.add_field(name="불참", value=mention_list(declined), inline=False)
@@ -415,7 +562,7 @@ class RecruitmentCog(commands.Cog):
             await interaction.followup.send("Gemini API 호출 중 문제가 발생했습니다. API 키, 모델명, 할당량을 확인해 주세요.", ephemeral=True)
             return
 
-        message, used_deferred_response = await self.post_recruitment_message(
+        message, used_deferred_response, thread_notice = await self.post_recruitment_message(
             interaction,
             title=title,
             target=description,
@@ -425,6 +572,8 @@ class RecruitmentCog(commands.Cog):
 
         if not used_deferred_response:
             await interaction.followup.send(f"Gemini가 모집 글을 만들었습니다: {message.jump_url}")
+        if thread_notice:
+            await interaction.followup.send(thread_notice, ephemeral=True)
 
 
 async def setup(bot: commands.Bot) -> None:
