@@ -31,7 +31,7 @@ GEMINI_RATE_LIMIT_MESSAGE = "⚠️ 봇이 너무 많은 요청을 처리하고 
 SCHEDULE_BOARD_STATE_KEY = "schedule_board"
 DISCORD_EVENT_SYNC_TAGS = ("[예선]", "[본선]")
 DISCORD_EVENT_SYNC_KEYWORDS = ("예선", "본선")
-SCHEDULE_END_LINE_PATTERN = re.compile(r"^\*\*종료\*\*\s*<t:(\d+)(?::[tTdDfFR])?>", re.MULTILINE)
+SCHEDULE_END_LINE_PATTERN = re.compile(r"^\*\*종료\*\*\s*<t:(\d+)(?::[tTdDfFR])?>.*$", re.MULTILINE)
 SCHEDULE_LOCATION_LINE_PATTERN = re.compile(r"^\*\*장소\*\*\s*(.+)$", re.MULTILINE)
 SCHEDULE_METADATA_LINE_PATTERN = re.compile(r"^\*\*(?:종료|장소)\*\*.*(?:\n|$)", re.MULTILINE)
 
@@ -123,7 +123,7 @@ class ScheduleModal(discord.ui.Modal, title="일정 추가"):
         body = str(self.body_input.value).strip()
         stored_body = body
         if ends_at != starts_at:
-            stored_body = f"**종료** {format_discord_timestamp(ends_at)}\n{body}".strip()
+            stored_body = f"**종료** {self.cog.format_schedule_time(ends_at)}\n{body}".strip()
 
         cursor = await self.cog.bot.database.execute(
             """
@@ -172,7 +172,7 @@ class ScheduleDeleteSelect(discord.ui.Select):
         for row in rows:
             starts_at = from_storage_iso(row["starts_at"], cog.bot.settings.timezone)
             label = str(row["title"])[:100]
-            description = starts_at.strftime("%Y-%m-%d %H:%M")
+            description = format_discord_timestamp(starts_at, "F")
             options.append(
                 discord.SelectOption(
                     label=label,
@@ -254,7 +254,7 @@ class ScheduleEditModal(discord.ui.Modal, title="일정 수정"):
         self.starts_at_input = discord.ui.TextInput(
             label="날짜/시간",
             placeholder="예: 2026-07-01 19:00",
-            default=starts_at.strftime("%Y-%m-%d %H:%M"),
+            default=starts_at.isoformat(sep=" ", timespec="minutes"),
             max_length=40,
         )
         self.body_input = discord.ui.TextInput(
@@ -335,7 +335,7 @@ class ScheduleEditSelect(discord.ui.Select):
             options.append(
                 discord.SelectOption(
                     label=str(row["title"])[:100],
-                    description=starts_at.strftime("%Y-%m-%d %H:%M"),
+                    description=format_discord_timestamp(starts_at, "F"),
                     value=str(row["id"]),
                 )
             )
@@ -432,13 +432,9 @@ class ScheduleCog(commands.Cog):
         starts_at = from_storage_iso(schedule_row["starts_at"], self.bot.settings.timezone)
         body = str(schedule_row["body"] or "")
 
-        end_match = SCHEDULE_END_LINE_PATTERN.search(body)
-        if end_match is None:
+        ends_at = self.extract_schedule_end_time(body, starts_at) or starts_at + timedelta(hours=1)
+        if ends_at <= starts_at:
             ends_at = starts_at + timedelta(hours=1)
-        else:
-            ends_at = datetime.fromtimestamp(int(end_match.group(1)), tz=starts_at.tzinfo)
-            if ends_at <= starts_at:
-                ends_at = starts_at + timedelta(hours=1)
 
         location_match = SCHEDULE_LOCATION_LINE_PATTERN.search(body)
         location = location_match.group(1).strip() if location_match is not None else "Discord"
@@ -447,6 +443,27 @@ class ScheduleCog(commands.Cog):
 
         description = SCHEDULE_METADATA_LINE_PATTERN.sub("", body).strip() or str(schedule_row["title"])
         return starts_at, ends_at, location[:100], description[:1000]
+
+    def format_schedule_time(self, value: datetime) -> str:
+        """절대 시간과 상대 시간을 함께 표시하는 Discord timestamp 문자열을 만듭니다."""
+        return f"{format_discord_timestamp(value, 'F')} ({format_discord_timestamp(value, 'R')})"
+
+    def format_schedule_range(self, starts_at: datetime, ends_at: datetime | None = None) -> str:
+        """일정 시작~종료 범위를 Discord timestamp 마크다운 한 줄로 표시합니다."""
+        if ends_at is None or int(ends_at.timestamp()) == int(starts_at.timestamp()):
+            return self.format_schedule_time(starts_at)
+        return f"{self.format_schedule_time(starts_at)} ~ {self.format_schedule_time(ends_at)}"
+
+    def extract_schedule_end_time(self, body: str, starts_at: datetime) -> datetime | None:
+        """body에 저장된 종료 timestamp 메타 라인을 datetime으로 되살립니다."""
+        end_match = SCHEDULE_END_LINE_PATTERN.search(body)
+        if end_match is None:
+            return None
+        return datetime.fromtimestamp(int(end_match.group(1)), tz=starts_at.tzinfo)
+
+    def clean_schedule_body_for_display(self, body: str) -> str:
+        """대시보드/목록에서 별도 기간 라인과 중복되는 종료 메타 라인을 제거합니다."""
+        return SCHEDULE_END_LINE_PATTERN.sub("", body).strip()
 
     async def find_existing_discord_event(self, guild: discord.Guild, title: str, starts_at: datetime) -> discord.ScheduledEvent | None:
         """DB event_id는 없지만 같은 이름/시작 시간의 서버 이벤트가 이미 있는지 확인합니다."""
@@ -612,11 +629,12 @@ class ScheduleCog(commands.Cog):
         lines: list[str] = []
         for row in rows:
             starts_at = from_storage_iso(row["starts_at"], self.bot.settings.timezone)
-            start_ts = int(starts_at.timestamp())
-            body = str(row["body"]).strip()
-            line = f"• **{row['title']}**\n  <t:{start_ts}:F> (<t:{start_ts}:R>)"
-            if body:
-                line += f"\n  {body[:300]}"
+            body = str(row["body"] or "").strip()
+            ends_at = self.extract_schedule_end_time(body, starts_at)
+            details = self.clean_schedule_body_for_display(body)
+            line = f"• **{row['title']}**\n  {self.format_schedule_range(starts_at, ends_at)}"
+            if details:
+                line += f"\n  {details[:300]}"
             if row["event_id"]:
                 line += f"\n  서버 이벤트 ID: `{row['event_id']}`"
             lines.append(line)
@@ -879,7 +897,7 @@ class ScheduleCog(commands.Cog):
             return None
 
         body = (
-            f"**종료** {format_discord_timestamp(ends_at)}\n"
+            f"**종료** {self.format_schedule_time(ends_at)}\n"
             f"**장소** {location or '공개된 정보 없음'}\n"
             f"{description}"
         )
@@ -940,7 +958,13 @@ class ScheduleCog(commands.Cog):
         embed = base_embed("Team 0x34 일정", "가까운 일정부터 최대 20개까지 표시합니다.")
         for row in rows:
             starts_at = from_storage_iso(row["starts_at"], self.bot.settings.timezone)
-            value = f"{format_discord_timestamp(starts_at)}\n{row['body']}\n등록자: <@{row['created_by']}>"
+            body = str(row["body"] or "").strip()
+            ends_at = self.extract_schedule_end_time(body, starts_at)
+            details = self.clean_schedule_body_for_display(body)
+            value = f"{self.format_schedule_range(starts_at, ends_at)}"
+            if details:
+                value += f"\n{details}"
+            value += f"\n등록자: <@{row['created_by']}>"
             if row["event_id"]:
                 value += f"\n서버 이벤트 ID: `{row['event_id']}`"
             embed.add_field(name=row["title"], value=value[:1024], inline=False)
@@ -1055,12 +1079,7 @@ class ScheduleCog(commands.Cog):
 
         summary_lines: list[str] = []
         for title, starts_at, ends_at in registered:
-            start_ts = int(starts_at.timestamp())
-            end_ts = int(ends_at.timestamp())
-            if starts_at == ends_at:
-                summary_lines.append(f"• **{title}**: <t:{start_ts}:F> (마감: <t:{start_ts}:R>)")
-            else:
-                summary_lines.append(f"• **{title}**: <t:{start_ts}:F> ~ <t:{end_ts}:F> (마감: <t:{end_ts}:R>)")
+            summary_lines.append(f"• **{title}**: {self.format_schedule_range(starts_at, ends_at)}")
         embed = base_embed(
             f"✨ 총 {len(registered)}개의 일정이 자동 등록되었습니다!",
             "\n".join(summary_lines)[:4000],
