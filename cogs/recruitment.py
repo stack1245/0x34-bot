@@ -9,8 +9,8 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from google.api_core import exceptions
-import google.generativeai as genai
 
+from services.ai import AIRequest
 from utils.ai_input import (
     CONVERSATIONAL_INPUT_INSTRUCTION,
     ScrapingError,
@@ -853,36 +853,26 @@ class RecruitmentCog(commands.Cog):
             return None
         return await self.remove_user_from_private_thread(thread, user)
 
-    def _generate_recruitment_copy_sync(self, source_text: str) -> str:
-        """Gemini SDK의 동기 API를 호출합니다.
-
-        google-generativeai의 기본 호출은 네트워크 I/O가 끝날 때까지 현재 스레드를 붙잡습니다.
-        이 함수는 아래 `generate_recruitment_copy`에서 `asyncio.to_thread`로 실행하므로
-        Discord 이벤트 루프와 다른 버튼/명령어 처리를 막지 않습니다.
-        """
-        if self.bot.settings.gemini_api_key is None:
-            raise RuntimeError("GEMINI_API_KEY가 설정되어 있지 않습니다. .env 또는 Railway Variables에 추가해 주세요.")
-
-        genai.configure(api_key=self.bot.settings.gemini_api_key)
-        model = genai.GenerativeModel(
-            model_name=self.bot.settings.gemini_model,
-            system_instruction=build_recruitment_system_prompt(),
-        )
-        response = model.generate_content(
+    async def generate_recruitment_copy_text(self, source_text: str) -> str:
+        """AI Provider를 통해 모집글 JSON 원문을 생성합니다."""
+        response = await self.bot.ai_provider.generate(
+            AIRequest(
+                system_instruction=build_recruitment_system_prompt(),
+                response_mime_type="application/json",
+                temperature=0.4,
+                prompt=(
             "다음은 사용자가 자유롭게 제공한 대화형 입력과 URL 크롤링 내용을 합친 원문입니다. "
             "사용자의 요청 의도와 어조를 유지하면서 모집글을 작성해라: "
             f"\n\n{source_text}\n\n"
-            "이 텍스트 내용만을 엄격하게 바탕으로, 없는 내용을 지어내지 말고 다음 규칙에 따라 모집글을 작성해라.",
-            generation_config={
-                "temperature": 0.4,
-                "response_mime_type": "application/json",
-            },
+                    "이 텍스트 내용만을 엄격하게 바탕으로, 없는 내용을 지어내지 말고 다음 규칙에 따라 모집글을 작성해라."
+                ),
+            )
         )
-        return str(getattr(response, "text", "") or "")
+        return response.text
 
     async def generate_recruitment_copy(self, source_text: str) -> tuple[str, str, int]:
-        """Gemini 호출을 백그라운드 스레드로 넘기고, 응답을 Embed용 데이터로 파싱합니다."""
-        raw_text = await asyncio.to_thread(self._generate_recruitment_copy_sync, source_text)
+        """AI 응답을 Embed용 데이터로 파싱합니다."""
+        raw_text = await self.generate_recruitment_copy_text(source_text)
         return parse_gemini_recruitment(raw_text, source_text)
 
     async def prepare_recruitment_source_text(self, target_info: str) -> str:

@@ -4,9 +4,13 @@ import asyncio
 import logging
 
 import discord
+from discord import app_commands
 from discord.ext import commands
 
 from config import Settings, load_settings
+from services.ai import build_ai_provider
+from services.error_handler import BotErrorHandler
+from services.state_manager import StateManager
 from utils.database import Database
 
 
@@ -32,6 +36,10 @@ class Team0x34Bot(commands.Bot):
 
         self.settings = settings
         self.database = Database(settings.database_path)
+        self.state_manager = StateManager(self.database)
+        self.ai_provider = build_ai_provider(api_key=settings.gemini_api_key, model_name=settings.gemini_model)
+        self.error_handler = BotErrorHandler()
+        self.tree.on_error = self.on_app_command_error
         if settings.enable_admin_text_commands:
             self._install_owner_sync_commands()
 
@@ -177,6 +185,18 @@ class Team0x34Bot(commands.Bot):
         """봇 종료 시 SQLite 연결도 같이 정리합니다."""
         await self.database.close()
         await super().close()
+
+    async def on_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
+        """Slash Command, Button, Select, Modal 처리 중 발생한 오류를 중앙에서 처리합니다."""
+        await self.error_handler.handle_app_command_error(interaction, error)
+
+    async def on_command_error(self, ctx: commands.Context, error: commands.CommandError) -> None:
+        """비상 텍스트 명령 오류를 중앙에서 처리합니다."""
+        await self.error_handler.handle_command_error(ctx, error)
+
+    async def on_error(self, event_method: str, /, *args, **kwargs) -> None:
+        """이벤트 핸들러의 미처리 예외를 로깅하고 봇 프로세스를 계속 유지합니다."""
+        await self.error_handler.handle_event_error(event_method, *args, **kwargs)
 
     async def on_ready(self) -> None:
         """봇이 Discord Gateway에 완전히 연결되면 현재 계정을 로그에 남깁니다."""

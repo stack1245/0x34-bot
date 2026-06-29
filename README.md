@@ -18,6 +18,15 @@ Team 0x34 운영을 위한 `discord.py` 기반 Discord 봇입니다. Slash Comma
 │   ├── tournament.py
 │   ├── recruitment.py
 │   └── maintenance.py
+├── services/
+│   ├── __init__.py
+│   ├── ai.py
+│   ├── base.py
+│   ├── error_handler.py
+│   └── state_manager.py
+├── repositories/
+│   ├── __init__.py
+│   └── base.py
 └── utils/
     ├── __init__.py
     ├── ai_input.py
@@ -25,6 +34,47 @@ Team 0x34 운영을 위한 `discord.py` 기반 Discord 봇입니다. Slash Comma
     ├── datetime.py
     └── embeds.py
 ```
+
+## 아키텍처 방향
+
+현재 `cogs/`는 Discord Slash Command, Modal, Button, Select의 진입점으로 유지하고, 신규 비즈니스 로직은 `services/`로 이동합니다. DB 접근은 `repositories/`가 담당하고, 공통 시간/Embed/입력 전처리처럼 순수한 도우미만 `utils/`에 둡니다. 이렇게 두면 일정, 모집, 유지보수 기능이 서로 직접 얽히지 않고 상태 관리자와 저장소 계약을 통해 같은 데이터를 다룹니다.
+
+```mermaid
+flowchart TD
+    subgraph Current[현재 구조]
+        Cogs1[cogs/*.py]
+        DB1[(SQLite)]
+        Gemini1[Gemini SDK]
+        Discord1[Discord UI/API]
+        Cogs1 --> DB1
+        Cogs1 --> Gemini1
+        Cogs1 --> Discord1
+    end
+
+    subgraph Target[개선 구조]
+        UI[Views / Modals / Cogs]
+        Services[Services\nScheduleService / RecruitmentService / StateManager / AIProvider]
+        Repos[Repositories\nScheduleRepository / RecruitmentRepository]
+        DB2[(SQLite WAL + async transaction)]
+        AI[AI Provider Interface\nGemini Flash / Pro / future provider]
+        Discord2[Discord API]
+        UI --> Services
+        Services --> Repos
+        Repos --> DB2
+        Services --> AI
+        Services --> Discord2
+    end
+```
+
+도입된 기반 인터페이스는 다음과 같습니다.
+
+- `services.base.BaseService`: 서비스 레이어 공통 로깅과 `run_safely()` 실패 격리
+- `services.state_manager.StateManager`: `dashboard_state`를 재시작 후에도 복구하는 단일 메시지 상태 관리자
+- `services.ai.AIProvider`: Gemini Flash/Pro 또는 다른 모델로 교체 가능한 AI 호출 인터페이스
+- `repositories.base.Repository`: `execute/fetch_one/fetch_all` 기반 비동기 저장소 계약
+- `services.error_handler.BotErrorHandler`: Slash Command, 텍스트 명령, 이벤트 예외를 중앙 처리하는 graceful degradation 계층
+
+SQLite는 `PRAGMA busy_timeout=5000`, `PRAGMA journal_mode=WAL`을 사용하며, 여러 SQL을 하나의 원자적 작업으로 묶어야 할 때는 `Database.transaction()`을 사용합니다. 일정 정리는 `is_deleted` 기반 soft delete를 기본으로 하며, 일반 조회는 `WHERE is_deleted = 0` 조건을 포함해야 합니다.
 
 ## 빠른 시작
 

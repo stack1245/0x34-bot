@@ -1,7 +1,8 @@
 from __future__ import annotations
 
+from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, AsyncIterator, Iterable
 
 import aiosqlite
 
@@ -102,6 +103,8 @@ class Database:
         self.connection = await aiosqlite.connect(self.path)
         self.connection.row_factory = aiosqlite.Row
         await self.connection.execute("PRAGMA foreign_keys = ON")
+        await self.connection.execute("PRAGMA busy_timeout = 5000")
+        await self.connection.execute("PRAGMA journal_mode = WAL")
 
         for statement in SCHEMA:
             await self.connection.execute(statement)
@@ -177,6 +180,19 @@ class Database:
         cursor = await connection.execute(query, tuple(params))
         await connection.commit()
         return cursor
+
+    @asynccontextmanager
+    async def transaction(self) -> AsyncIterator[aiosqlite.Connection]:
+        """Run multiple low-level statements in one async SQLite transaction."""
+        connection = self._require_connection()
+        try:
+            await connection.execute("BEGIN")
+            yield connection
+        except Exception:
+            await connection.rollback()
+            raise
+        else:
+            await connection.commit()
 
     async def fetch_one(self, query: str, params: Iterable[Any] = ()) -> aiosqlite.Row | None:
         """하나의 행만 필요한 SELECT 쿼리에 사용합니다."""

@@ -10,8 +10,8 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 from google.api_core import exceptions
-import google.generativeai as genai
 
+from services.ai import AIRequest
 from utils.ai_input import CONVERSATIONAL_INPUT_INSTRUCTION, ScrapingError, prepare_conversational_source_text
 from utils.datetime import (
     fix_past_year,
@@ -560,35 +560,15 @@ class ScheduleCog(commands.Cog):
 
     async def fetch_schedule_board_state(self):
         """DB에서 일정 대시보드 메시지 위치를 가져옵니다."""
-        return await self.bot.database.fetch_one(
-            """
-            SELECT board_channel_id, board_message_id FROM dashboard_state
-            WHERE name = ?
-            """,
-            (SCHEDULE_BOARD_STATE_KEY,),
-        )
+        return await self.bot.state_manager.get_dashboard_state(SCHEDULE_BOARD_STATE_KEY)
 
     async def save_schedule_board_state(self, channel_id: int, message_id: int) -> None:
         """일정 대시보드 메시지 위치를 DB에 저장하거나 덮어씁니다."""
-        await self.bot.database.execute(
-            """
-            INSERT INTO dashboard_state (name, board_channel_id, board_message_id, updated_at)
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(name)
-            DO UPDATE SET
-                board_channel_id = excluded.board_channel_id,
-                board_message_id = excluded.board_message_id,
-                updated_at = excluded.updated_at
-            """,
-            (SCHEDULE_BOARD_STATE_KEY, channel_id, message_id, now_utc_iso()),
-        )
+        await self.bot.state_manager.save_dashboard_state(SCHEDULE_BOARD_STATE_KEY, channel_id, message_id)
 
     async def clear_schedule_board_state(self) -> None:
         """삭제된 채널/메시지를 가리키는 일정 대시보드 상태를 제거합니다."""
-        await self.bot.database.execute(
-            "DELETE FROM dashboard_state WHERE name = ?",
-            (SCHEDULE_BOARD_STATE_KEY,),
-        )
+        await self.bot.state_manager.clear_dashboard_state(SCHEDULE_BOARD_STATE_KEY)
 
     async def resolve_schedule_board_channel(self, guild_id: int | None = None) -> discord.abc.Messageable | None:
         """새 일정 대시보드를 만들 채널을 찾습니다."""
@@ -678,10 +658,10 @@ class ScheduleCog(commands.Cog):
         embed = self.build_schedule_board_embed(rows)
         state = await self.fetch_schedule_board_state()
 
-        if state is not None and state["board_channel_id"] is not None and state["board_message_id"] is not None:
+        if state is not None and state.board_channel_id is not None and state.board_message_id is not None:
             try:
-                channel_id = int(state["board_channel_id"])
-                message_id = int(state["board_message_id"])
+                channel_id = int(state.board_channel_id)
+                message_id = int(state.board_message_id)
                 channel = self.bot.get_channel(channel_id)
                 if channel is None:
                     channel = await self.bot.fetch_channel(channel_id)
@@ -784,30 +764,25 @@ class ScheduleCog(commands.Cog):
             return []
         return [item for item in payload if isinstance(item, dict)]
 
-    def generate_schedule_json_sync(self, source_text: str) -> str:
-        """Gemini 동기 SDK 호출을 별도 스레드에서 실행하기 위한 함수입니다."""
-        if self.bot.settings.gemini_api_key is None:
-            raise RuntimeError("GEMINI_API_KEY가 설정되어 있지 않습니다. .env 또는 Railway Variables에 추가해 주세요.")
-
-        genai.configure(api_key=self.bot.settings.gemini_api_key)
-        model = genai.GenerativeModel(
-            model_name=self.bot.settings.gemini_model,
-            system_instruction=build_schedule_generation_prompt(),
-        )
-        response = model.generate_content(
+    async def generate_schedule_json(self, source_text: str) -> str:
+        """AI Provider를 통해 일정 JSON을 생성합니다."""
+        response = await self.bot.ai_provider.generate(
+            AIRequest(
+                system_instruction=build_schedule_generation_prompt(),
+                response_mime_type="application/json",
+                temperature=0.2,
+                prompt=(
             "다음은 사용자가 자유롭게 제공한 대화형 입력과 URL 크롤링 내용을 합친 원문입니다. "
             "사용자의 요청 의도와 어조를 유지하면서 등록할 수 있는 모든 일정을 JSON 배열로 추출해 주세요.\n\n"
-            f"{source_text}",
-            generation_config={
-                "temperature": 0.2,
-                "response_mime_type": "application/json",
-            },
+                    f"{source_text}"
+                ),
+            )
         )
-        return str(getattr(response, "text", "") or "")
+        return response.text
 
     async def generate_schedule_items(self, source_text: str) -> list[dict]:
-        """Gemini 호출을 이벤트 루프 밖 스레드로 넘기고 JSON 배열을 파싱합니다."""
-        raw_text = await asyncio.to_thread(self.generate_schedule_json_sync, source_text)
+        """AI 응답 JSON 배열을 파싱합니다."""
+        raw_text = await self.generate_schedule_json(source_text)
         return self.parse_generated_schedules(raw_text)
 
     async def prepare_schedule_source_text(self, target_info: str) -> str:
@@ -845,32 +820,26 @@ class ScheduleCog(commands.Cog):
             raise ValueError("Gemini datetime payload has end_time before start_time")
         return starts_at, ends_at
 
-    def generate_manual_schedule_datetime_json_sync(self, *, title: str, date_text: str, body: str) -> str:
-        """수동 일정 Modal의 자유 형식 날짜/시간을 Gemini JSON 응답으로 변환합니다."""
-        if self.bot.settings.gemini_api_key is None:
-            raise RuntimeError("GEMINI_API_KEY가 설정되어 있지 않습니다. .env 또는 Railway Variables에 추가해 주세요.")
-
-        genai.configure(api_key=self.bot.settings.gemini_api_key)
-        model = genai.GenerativeModel(
-            model_name=self.bot.settings.gemini_model,
-            system_instruction=build_schedule_datetime_parse_prompt(),
+    async def generate_manual_schedule_datetime_json(self, *, title: str, date_text: str, body: str) -> str:
+        """수동 일정 Modal의 자유 형식 날짜/시간을 AI JSON 응답으로 변환합니다."""
+        response = await self.bot.ai_provider.generate(
+            AIRequest(
+                system_instruction=build_schedule_datetime_parse_prompt(),
+                response_mime_type="application/json",
+                temperature=0.1,
+                prompt=(
+                    "다음 수동 일정 입력에서 날짜/시간을 해석해 start_time과 end_time JSON으로 변환해 주세요.\n\n"
+                    f"제목: {title}\n"
+                    f"날짜/시간 입력: {date_text}\n"
+                    f"내용: {body}"
+                ),
+            )
         )
-        response = model.generate_content(
-            "다음 수동 일정 입력에서 날짜/시간을 해석해 start_time과 end_time JSON으로 변환해 주세요.\n\n"
-            f"제목: {title}\n"
-            f"날짜/시간 입력: {date_text}\n"
-            f"내용: {body}",
-            generation_config={
-                "temperature": 0.1,
-                "response_mime_type": "application/json",
-            },
-        )
-        return str(getattr(response, "text", "") or "")
+        return response.text
 
     async def parse_manual_schedule_datetimes(self, *, title: str, date_text: str, body: str) -> tuple[datetime, datetime]:
-        """Gemini 호출을 백그라운드 스레드에서 실행하고 수동 일정 날짜 범위를 반환합니다."""
-        raw_text = await asyncio.to_thread(
-            self.generate_manual_schedule_datetime_json_sync,
+        """AI 호출 결과에서 수동 일정 날짜 범위를 반환합니다."""
+        raw_text = await self.generate_manual_schedule_datetime_json(
             title=title,
             date_text=date_text,
             body=body,
