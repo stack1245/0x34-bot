@@ -200,7 +200,7 @@ class ScheduleDeleteSelect(discord.ui.Select):
         row = await self.cog.bot.database.fetch_one(
             """
             SELECT * FROM schedules
-            WHERE id = ? AND guild_id = ?
+            WHERE id = ? AND guild_id = ? AND is_deleted = 0
             """,
             (schedule_id, interaction.guild.id),
         )
@@ -209,7 +209,10 @@ class ScheduleDeleteSelect(discord.ui.Select):
             return
 
         event_notice = await self.cog.delete_linked_server_event(interaction.guild, row["event_id"])
-        await self.cog.bot.database.execute("DELETE FROM schedules WHERE id = ?", (schedule_id,))
+        await self.cog.bot.database.execute(
+            "UPDATE schedules SET is_deleted = 1, deleted_at = ? WHERE id = ?",
+            (now_utc_iso(), schedule_id),
+        )
         await self.cog.update_schedule_board()
 
         message = "✅ 성공적으로 일정이 삭제되었습니다."
@@ -294,7 +297,7 @@ class ScheduleEditModal(discord.ui.Modal, title="일정 수정"):
         row = await self.cog.bot.database.fetch_one(
             """
             SELECT * FROM schedules
-            WHERE id = ? AND guild_id = ?
+            WHERE id = ? AND guild_id = ? AND is_deleted = 0
             """,
             (self.schedule_id, interaction.guild.id),
         )
@@ -356,7 +359,7 @@ class ScheduleEditSelect(discord.ui.Select):
         row = await self.cog.bot.database.fetch_one(
             """
             SELECT * FROM schedules
-            WHERE id = ? AND guild_id = ?
+            WHERE id = ? AND guild_id = ? AND is_deleted = 0
             """,
             (schedule_id, interaction.guild.id),
         )
@@ -652,6 +655,7 @@ class ScheduleCog(commands.Cog):
         rows = await self.bot.database.fetch_all(
             """
             SELECT * FROM schedules
+            WHERE is_deleted = 0
             ORDER BY starts_at ASC
             """,
         )
@@ -666,6 +670,7 @@ class ScheduleCog(commands.Cog):
             rows = await self.bot.database.fetch_all(
                 """
                 SELECT * FROM schedules
+                WHERE is_deleted = 0
                 ORDER BY starts_at ASC
                 """,
             )
@@ -943,7 +948,7 @@ class ScheduleCog(commands.Cog):
         rows = await self.bot.database.fetch_all(
             """
             SELECT * FROM schedules
-            WHERE guild_id = ?
+            WHERE guild_id = ? AND is_deleted = 0
             ORDER BY starts_at ASC
             LIMIT 20
             """,
@@ -986,7 +991,7 @@ class ScheduleCog(commands.Cog):
         rows = await self.bot.database.fetch_all(
             """
             SELECT id, title, starts_at, event_id FROM schedules
-            WHERE guild_id = ?
+            WHERE guild_id = ? AND is_deleted = 0
             ORDER BY starts_at ASC
             LIMIT 25
             """,
@@ -1014,7 +1019,7 @@ class ScheduleCog(commands.Cog):
         rows = await self.bot.database.fetch_all(
             """
             SELECT id, title, starts_at, body, created_by, event_id FROM schedules
-            WHERE guild_id = ? AND (created_by = ? OR starts_at >= ?)
+            WHERE guild_id = ? AND is_deleted = 0 AND (created_by = ? OR starts_at >= ?)
             ORDER BY starts_at ASC
             LIMIT 25
             """,

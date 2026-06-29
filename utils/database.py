@@ -16,7 +16,10 @@ SCHEMA: tuple[str, ...] = (
         body TEXT NOT NULL,
         created_by INTEGER NOT NULL,
         created_at TEXT NOT NULL,
-        event_id INTEGER
+        event_id INTEGER,
+        is_confirmed INTEGER NOT NULL DEFAULT 0,
+        is_deleted INTEGER NOT NULL DEFAULT 0,
+        deleted_at TEXT
     )
     """,
     """
@@ -108,6 +111,15 @@ class Database:
     async def _run_migrations(self) -> None:
         """이미 만들어진 SQLite DB에도 새 컬럼을 안전하게 추가합니다."""
         connection = self._require_connection()
+        cursor = await connection.execute("PRAGMA table_info(schedules)")
+        schedule_columns = {row[1] for row in await cursor.fetchall()}
+        if "is_confirmed" not in schedule_columns:
+            await connection.execute("ALTER TABLE schedules ADD COLUMN is_confirmed INTEGER NOT NULL DEFAULT 0")
+        if "is_deleted" not in schedule_columns:
+            await connection.execute("ALTER TABLE schedules ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0")
+        if "deleted_at" not in schedule_columns:
+            await connection.execute("ALTER TABLE schedules ADD COLUMN deleted_at TEXT")
+
         cursor = await connection.execute("PRAGMA table_info(recruitments)")
         columns = {row[1] for row in await cursor.fetchall()}
         if "thread_id" not in columns:

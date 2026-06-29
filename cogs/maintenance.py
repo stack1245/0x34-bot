@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -12,6 +12,7 @@ from discord.ext import commands, tasks
 
 
 KST = ZoneInfo("Asia/Seoul")
+SCHEDULE_CONFIRMED_GRACE_DAYS = 7
 
 
 class MaintenanceCog(commands.Cog):
@@ -116,20 +117,50 @@ class MaintenanceCog(commands.Cog):
             return True
         return True
 
+    async def scheduled_event_has_ended(self, guild_id: int, event_id: int) -> bool:
+        """연결된 Discord Scheduled Event가 종료/취소 상태인지 확인합니다."""
+        guild = await self.resolve_guild(guild_id)
+        if guild is None:
+            return False
+
+        try:
+            event = await guild.fetch_scheduled_event(event_id)
+        except discord.NotFound:
+            logging.info("[Maintenance] 일정 이벤트 %s를 찾을 수 없어 삭제 검증을 건너뜁니다.", event_id)
+            return False
+        except (discord.Forbidden, discord.HTTPException) as exc:
+            logging.info("[Maintenance] 일정 이벤트 %s 상태를 확인할 수 없어 삭제 검증을 건너뜁니다: %s", event_id, exc)
+            return False
+
+        status = getattr(event, "status", None)
+        status_name = getattr(status, "name", str(status)).lower()
+        if status_name in {"completed", "cancelled", "canceled"}:
+            return True
+
+        end_time = getattr(event, "end_time", None)
+        if end_time is None:
+            return False
+        if end_time.tzinfo is None:
+            end_time = end_time.replace(tzinfo=timezone.utc)
+        return end_time <= datetime.now(timezone.utc)
+
     async def cleanup_schedules(self) -> int:
-        """삭제된 Discord 서버 이벤트를 가리키는 일정 레코드를 정리합니다."""
+        """삭제된 Discord 서버 이벤트를 가리키는 일정 레코드를 soft delete합니다."""
         deleted_count = 0
         rows = await self.bot.database.fetch_all(
             """
             SELECT id, guild_id, event_id FROM schedules
-            WHERE event_id IS NOT NULL
+            WHERE event_id IS NOT NULL AND is_deleted = 0
             """,
         )
 
         for row in rows:
             exists = await self.scheduled_event_exists(int(row["guild_id"]), int(row["event_id"]))
             if not exists:
-                await self.bot.database.execute("DELETE FROM schedules WHERE id = ?", (row["id"],))
+                await self.bot.database.execute(
+                    "UPDATE schedules SET is_deleted = 1, deleted_at = ? WHERE id = ?",
+                    (datetime.now(timezone.utc).isoformat(), row["id"]),
+                )
                 deleted_count += 1
             await asyncio.sleep(0.5)
 
@@ -196,35 +227,70 @@ class MaintenanceCog(commands.Cog):
         return parsed.astimezone(KST)
 
     async def delete_past_schedules(self) -> int:
-        """현재 한국 시간보다 과거인 일정을 DB에서 삭제합니다."""
+        """호환용 래퍼입니다. 실제 정리는 safe_cleanup()에서 수행합니다."""
+        return await self.safe_cleanup(dry_run=False)
+
+    async def safe_cleanup(self, *, dry_run: bool = False) -> int:
+        """검증을 통과한 지난 일정만 soft delete합니다."""
         now = datetime.now(KST)
-        rows = await self.bot.database.fetch_all("SELECT id, starts_at FROM schedules")
-        expired_ids: list[int] = []
+        rows = await self.bot.database.fetch_all(
+            """
+            SELECT id, guild_id, starts_at, event_id, is_confirmed
+            FROM schedules
+            WHERE is_deleted = 0
+            ORDER BY starts_at ASC
+            """,
+        )
+        cleanup_ids: list[int] = []
 
         for row in rows:
             starts_at = self.parse_schedule_datetime(row["starts_at"])
             if starts_at is None:
                 logging.info("[Maintenance] 일정 %s의 날짜 형식을 파싱할 수 없어 자동 삭제를 건너뜁니다.", row["id"])
                 continue
-            if starts_at < now:
-                expired_ids.append(int(row["id"]))
+            if starts_at >= now:
+                continue
 
-        if not expired_ids:
+            if bool(row["is_confirmed"]):
+                confirmed_cleanup_at = starts_at + timedelta(days=SCHEDULE_CONFIRMED_GRACE_DAYS)
+                if confirmed_cleanup_at > now:
+                    logging.info(
+                        "[Maintenance] 확정 일정 %s는 %s일까지 유예 기간이라 삭제를 건너뜁니다.",
+                        row["id"],
+                        confirmed_cleanup_at.isoformat(),
+                    )
+                    continue
+
+            event_id = row["event_id"]
+            if event_id is not None:
+                event_finished = await self.scheduled_event_has_ended(int(row["guild_id"]), int(event_id))
+                if not event_finished:
+                    logging.info("[Maintenance] 일정 %s는 연결된 Discord 이벤트 종료가 확인되지 않아 삭제를 건너뜁니다.", row["id"])
+                    continue
+                await asyncio.sleep(0.5)
+
+            cleanup_ids.append(int(row["id"]))
+
+        logging.info("[Maintenance] 삭제 예정 데이터: %s", cleanup_ids)
+
+        if dry_run or not cleanup_ids:
             return 0
 
-        placeholders = ",".join("?" for _ in expired_ids)
-        await self.bot.database.execute(
-            f"DELETE FROM schedules WHERE id IN ({placeholders})",
-            expired_ids,
-        )
-        return len(expired_ids)
+        deleted_at = datetime.now(timezone.utc).isoformat()
+        for schedule_id in cleanup_ids:
+            await self.bot.database.execute(
+                "UPDATE schedules SET is_deleted = 1, deleted_at = ? WHERE id = ?",
+                (deleted_at, schedule_id),
+            )
+
+        return len(cleanup_ids)
 
     @tasks.loop(hours=24)
     async def auto_cleanup_past_schedules(self) -> None:
-        """매일 한 번 만료된 일정을 자동 삭제합니다."""
+        """매일 한 번 안전 검증을 통과한 지난 일정을 soft delete합니다."""
         deleted_count = await self.delete_past_schedules()
         if deleted_count:
-            logging.info("[Maintenance] %s개의 만료된 일정을 자동 삭제했습니다.", deleted_count)
+            logging.info("[Maintenance] %s개의 만료된 일정을 soft delete 처리했습니다.", deleted_count)
 
     @auto_cleanup_past_schedules.before_loop
     async def before_auto_cleanup_past_schedules(self) -> None:
@@ -273,6 +339,46 @@ class MaintenanceCog(commands.Cog):
             f"✅ DB 정리가 완료되었습니다. (삭제된 쓰레기 데이터: 총 {deleted_count}개)",
             ephemeral=True,
         )
+
+    @app_commands.command(name="복구", description="관리자 전용: soft delete된 일정을 복구합니다.")
+    @app_commands.describe(schedule_id="복구할 schedules.id")
+    @app_commands.default_permissions(administrator=True)
+    @app_commands.guild_only()
+    async def restore_schedule(self, interaction: discord.Interaction, schedule_id: int) -> None:
+        """is_deleted 플래그를 되돌려 soft delete된 일정을 복구합니다."""
+        await interaction.response.defer(ephemeral=True)
+
+        if interaction.guild is None:
+            await interaction.followup.send("서버 안에서만 일정을 복구할 수 있습니다.", ephemeral=True)
+            return
+        if not await self.is_admin(interaction):
+            await interaction.followup.send("이 명령어는 서버 관리자만 사용할 수 있습니다.", ephemeral=True)
+            return
+
+        row = await self.bot.database.fetch_one(
+            """
+            SELECT id, title, is_deleted FROM schedules
+            WHERE id = ? AND guild_id = ?
+            """,
+            (schedule_id, interaction.guild.id),
+        )
+        if row is None:
+            await interaction.followup.send("해당 ID의 일정을 찾을 수 없습니다.", ephemeral=True)
+            return
+        if not bool(row["is_deleted"]):
+            await interaction.followup.send("이미 활성 상태인 일정입니다.", ephemeral=True)
+            return
+
+        await self.bot.database.execute(
+            "UPDATE schedules SET is_deleted = 0, deleted_at = NULL WHERE id = ? AND guild_id = ?",
+            (schedule_id, interaction.guild.id),
+        )
+
+        schedule_cog = self.bot.get_cog("ScheduleCog")
+        if schedule_cog is not None and hasattr(schedule_cog, "update_schedule_board"):
+            await schedule_cog.update_schedule_board()
+
+        await interaction.followup.send(f"✅ 일정 `{row['title']}`을 복구했습니다.", ephemeral=True)
 
 
 async def setup(bot: commands.Bot) -> None:
