@@ -186,7 +186,7 @@ class RecruitmentView(discord.ui.View):
 
     @discord.ui.button(label="관리하기", style=discord.ButtonStyle.secondary, custom_id="0x34:recruitment:manage")
     async def manage(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        """작성자가 pending 신청자를 승인/거절할 수 있는 관리 UI를 엽니다."""
+        """모집 소유자에게 비공개 워크스페이스 관리 위치를 안내합니다."""
         recruitment = await self.get_open_recruitment(interaction)
         if recruitment is None:
             return
@@ -194,10 +194,15 @@ class RecruitmentView(discord.ui.View):
             await interaction.response.send_message("모집 소유자만 신청자를 관리할 수 있습니다.", ephemeral=True)
             return
 
-        pending_rows = await self.cog.get_pending_participants(recruitment["id"])
-        embed = self.cog.build_participant_management_embed(recruitment, pending_rows)
-        view = ManageParticipantsView(self.cog, int(recruitment["id"]), int(interaction.user.id), pending_rows)
-        await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
+        thread = await self.cog.get_recruitment_thread(recruitment, interaction.guild)
+        if thread is None:
+            await interaction.response.send_message("연결된 비공개 워크스페이스를 찾을 수 없습니다.", ephemeral=True)
+            return
+
+        await interaction.response.send_message(
+            f"신청 승인/거절은 비공개 워크스페이스에서 처리합니다: {thread.mention}",
+            ephemeral=True,
+        )
 
     @discord.ui.button(label="모집 마감", style=discord.ButtonStyle.primary, custom_id="0x34:recruitment:close")
     async def close_recruitment(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -259,8 +264,12 @@ class RecruitmentApplicationModal(discord.ui.Modal, title="모집 신청"):
         self.message_id = message_id
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        """신청 내용을 pending 상태로 저장하고 작성자에게 알립니다."""
+        """신청 내용을 pending 상태로 저장하고 비공개 스레드에 관리 Embed를 남깁니다."""
         await interaction.response.defer(ephemeral=True, thinking=True)
+
+        if interaction.guild is None:
+            await interaction.followup.send("서버 안에서만 모집에 신청할 수 있습니다.", ephemeral=True)
+            return
 
         recruitment = await self.cog.get_recruitment(self.message_id)
         if recruitment is None or int(recruitment["id"]) != self.recruitment_id:
@@ -280,162 +289,141 @@ class RecruitmentApplicationModal(discord.ui.Modal, title="모집 신청"):
             PARTICIPANT_PENDING,
             application_reason=reason,
         )
-        await self.cog.notify_recruitment_owner(recruitment, interaction.user, reason)
+        await self.cog.edit_recruitment_message(int(recruitment["channel_id"]), int(recruitment["message_id"]))
+
+        thread = await self.cog.get_recruitment_thread(recruitment, interaction.guild)
+        if thread is None:
+            notice = await self.cog.notify_recruitment_owner(recruitment, interaction.user, reason)
+            message = "신청은 접수되었지만 연결된 비공개 워크스페이스를 찾지 못했습니다."
+            if notice:
+                message += f"\n{notice}"
+            await interaction.followup.send(message, ephemeral=True)
+            return
+
+        application_embed = self.cog.build_application_manage_embed(
+            recruitment,
+            applicant_id=interaction.user.id,
+            applicant_mention=interaction.user.mention,
+            application_reason=reason,
+        )
+        application_view = ApplicationManageView(
+            self.cog,
+            recruitment_id=self.recruitment_id,
+            applicant_id=interaction.user.id,
+            application_reason=reason,
+        )
+        try:
+            await thread.send(embed=application_embed, view=application_view)
+        except discord.Forbidden:
+            await interaction.followup.send("신청은 접수되었지만 비공개 워크스페이스에 알림을 보낼 권한이 없습니다.", ephemeral=True)
+            return
+        except discord.HTTPException as exc:
+            await interaction.followup.send(f"신청은 접수되었지만 비공개 워크스페이스 알림 전송에 실패했습니다: {exc.text}", ephemeral=True)
+            return
 
         await interaction.followup.send("신청이 접수되었습니다. 작성자의 승인을 기다려 주세요.", ephemeral=True)
 
 
-class PendingParticipantsSelect(discord.ui.Select):
-    """pending 신청자 중 검토할 사람을 선택합니다."""
+class ApplicationManageView(discord.ui.View):
+    """비공개 워크스페이스 안에서 개별 참가 신청을 승인/거절하는 View입니다."""
 
-    def __init__(self, rows: list) -> None:
-        options: list[discord.SelectOption] = []
-        for row in rows[:25]:
-            reason = str(row["application_reason"] or "신청 사유 없음")
-            options.append(
-                discord.SelectOption(
-                    label=f"사용자 {row['user_id']}"[:100],
-                    description=reason[:100],
-                    value=str(row["user_id"]),
-                )
-            )
-
-        super().__init__(
-            placeholder="검토할 신청자를 선택하세요.",
-            min_values=1,
-            max_values=1,
-            options=options,
-        )
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        view = self.view
-        if not isinstance(view, ManageParticipantsView):
-            await interaction.response.send_message("관리 화면 상태를 찾을 수 없습니다.", ephemeral=True)
-            return
-
-        selected_user_id = int(self.values[0])
-        pending_rows = await view.cog.get_pending_participants(view.recruitment_id)
-        recruitment = await view.cog.get_recruitment_by_id(view.recruitment_id)
-        if recruitment is None:
-            await interaction.response.edit_message(content="모집 정보를 찾을 수 없습니다.", embed=None, view=None)
-            return
-
-        selected = next((row for row in pending_rows if int(row["user_id"]) == selected_user_id), None)
-        embed = view.cog.build_participant_management_embed(recruitment, pending_rows, selected)
-        await interaction.response.edit_message(
-            embed=embed,
-            view=ManageParticipantsView(view.cog, view.recruitment_id, view.owner_id, pending_rows, selected_user_id),
-        )
-
-
-class ManageParticipantsView(discord.ui.View):
-    """작성자가 pending 신청자를 선택해 승인/거절하는 Ephemeral 관리 View입니다."""
-
-    def __init__(
-        self,
-        cog: "RecruitmentCog",
-        recruitment_id: int,
-        owner_id: int,
-        pending_rows: list,
-        selected_user_id: int | None = None,
-    ) -> None:
-        super().__init__(timeout=180)
+    def __init__(self, cog: "RecruitmentCog", recruitment_id: int, applicant_id: int, application_reason: str) -> None:
+        super().__init__(timeout=7 * 24 * 60 * 60)
         self.cog = cog
         self.recruitment_id = recruitment_id
-        self.owner_id = owner_id
-        self.selected_user_id = selected_user_id
-        self.pending_rows = pending_rows
-
-        if pending_rows:
-            self.add_item(PendingParticipantsSelect(pending_rows))
-
-        for child in self.children:
-            if isinstance(child, discord.ui.Button) and child.custom_id in {"0x34:recruitment:approve", "0x34:recruitment:reject"}:
-                child.disabled = selected_user_id is None
+        self.applicant_id = applicant_id
+        self.application_reason = application_reason
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         if await self.cog.is_recruitment_owner(self.recruitment_id, interaction.user.id):
             return True
-        await interaction.response.send_message("모집 소유자만 신청자를 관리할 수 있습니다.", ephemeral=True)
+        await interaction.response.send_message("모집 소유자만 신청을 승인하거나 거절할 수 있습니다.", ephemeral=True)
         return False
 
-    @discord.ui.button(label="승인", style=discord.ButtonStyle.success, custom_id="0x34:recruitment:approve")
+    def disable_buttons(self) -> None:
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                child.disabled = True
+
+    @discord.ui.button(label="✅ 승인", style=discord.ButtonStyle.success, custom_id="0x34:recruitment:application:approve")
     async def approve(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        """선택한 신청자를 accepted로 바꾸고 모집 Embed를 갱신합니다."""
-        if self.selected_user_id is None:
-            await interaction.response.send_message("먼저 신청자를 선택해 주세요.", ephemeral=True)
+        """신청자를 accepted로 바꾸고 정확한 Member 객체를 비공개 스레드에 초대합니다."""
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if interaction.guild is None:
+            await interaction.followup.send("서버 정보를 찾을 수 없어 신청을 승인할 수 없습니다.", ephemeral=True)
             return
 
-        await interaction.response.defer(ephemeral=True, thinking=True)
         recruitment = await self.cog.get_recruitment_by_id(self.recruitment_id)
         if recruitment is None:
-            await interaction.edit_original_response(content="모집 정보를 찾을 수 없습니다.", embed=None, view=None)
+            await interaction.followup.send("모집 정보를 찾을 수 없습니다.", ephemeral=True)
             return
 
         if recruitment["max_members"] > 0:
             confirmed = await self.cog.get_confirmed_participant_user_ids(self.recruitment_id)
-            if self.selected_user_id not in confirmed and len(confirmed) >= recruitment["max_members"]:
-                await interaction.edit_original_response(content="정원이 이미 찼습니다.", embed=None, view=None)
+            if self.applicant_id not in confirmed and len(confirmed) >= recruitment["max_members"]:
+                await interaction.followup.send("정원이 이미 찼습니다.", ephemeral=True)
                 return
 
-        await self.cog.save_participant_status(self.recruitment_id, self.selected_user_id, PARTICIPANT_ACCEPTED)
-        thread_notice = await self.cog.sync_private_thread_membership(recruitment, discord.Object(id=self.selected_user_id), PARTICIPANT_ACCEPTED)
+        await self.cog.save_participant_status(self.recruitment_id, self.applicant_id, PARTICIPANT_ACCEPTED)
         await self.cog.edit_recruitment_message(int(recruitment["channel_id"]), int(recruitment["message_id"]))
 
-        pending_rows = await self.cog.get_pending_participants(self.recruitment_id)
-        embed = self.cog.build_participant_management_embed(recruitment, pending_rows, notice=f"<@{self.selected_user_id}> 신청을 승인했습니다.")
-        content = thread_notice if thread_notice else None
-        await interaction.edit_original_response(content=content, embed=embed, view=ManageParticipantsView(self.cog, self.recruitment_id, self.owner_id, pending_rows))
+        thread = await self.cog.get_recruitment_thread(recruitment, interaction.guild)
+        invite_notice = "연결된 비공개 워크스페이스를 찾지 못해 스레드 초대는 건너뛰었습니다."
+        if thread is not None:
+            invite_notice = await self.cog.add_member_to_private_thread(interaction.guild, thread, self.applicant_id)
+            if invite_notice is None:
+                invite_notice = f"<@{self.applicant_id}> 님을 비공개 워크스페이스에 초대했습니다."
 
-    @discord.ui.button(label="거절", style=discord.ButtonStyle.danger, custom_id="0x34:recruitment:reject")
+        await self.finish(
+            interaction,
+            recruitment,
+            title="✅ 승인 완료",
+            color=SUCCESS_COLOR,
+            notice=invite_notice,
+        )
+        await interaction.followup.send(invite_notice, ephemeral=True)
+
+    @discord.ui.button(label="❌ 거절", style=discord.ButtonStyle.danger, custom_id="0x34:recruitment:application:reject")
     async def reject(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        """선택한 신청자를 거절하기 위해 사유 입력 Modal을 엽니다."""
-        if self.selected_user_id is None:
-            await interaction.response.send_message("먼저 신청자를 선택해 주세요.", ephemeral=True)
-            return
-
-        await interaction.response.send_modal(RejectParticipantModal(self.cog, self.recruitment_id, self.owner_id, self.selected_user_id))
-
-
-class RejectParticipantModal(discord.ui.Modal, title="신청 거절"):
-    """작성자가 거절 사유를 선택적으로 입력하는 Modal입니다."""
-
-    reason_input = discord.ui.TextInput(
-        label="거절 사유",
-        placeholder="비워 두면 별도 사유 없이 거절됩니다.",
-        style=discord.TextStyle.long,
-        required=False,
-        max_length=1000,
-    )
-
-    def __init__(self, cog: "RecruitmentCog", recruitment_id: int, owner_id: int, user_id: int) -> None:
-        super().__init__()
-        self.cog = cog
-        self.recruitment_id = recruitment_id
-        self.owner_id = owner_id
-        self.user_id = user_id
-
-    async def on_submit(self, interaction: discord.Interaction) -> None:
-        if not await self.cog.is_recruitment_owner(self.recruitment_id, interaction.user.id):
-            await interaction.response.send_message("모집 소유자만 신청자를 관리할 수 있습니다.", ephemeral=True)
-            return
-
+        """신청자를 rejected 상태로 바꾸고 스레드 신청 카드에 처리 내역을 남깁니다."""
         await interaction.response.defer(ephemeral=True, thinking=True)
         recruitment = await self.cog.get_recruitment_by_id(self.recruitment_id)
         if recruitment is None:
             await interaction.followup.send("모집 정보를 찾을 수 없습니다.", ephemeral=True)
             return
 
-        reason = str(self.reason_input.value).strip()
-        await self.cog.save_participant_status(
-            self.recruitment_id,
-            self.user_id,
-            PARTICIPANT_REJECTED,
-            rejection_reason=reason,
-        )
-        await self.cog.sync_private_thread_membership(recruitment, discord.Object(id=self.user_id), PARTICIPANT_REJECTED)
+        await self.cog.save_participant_status(self.recruitment_id, self.applicant_id, PARTICIPANT_REJECTED)
         await self.cog.edit_recruitment_message(int(recruitment["channel_id"]), int(recruitment["message_id"]))
-        await interaction.followup.send(f"<@{self.user_id}> 신청을 거절했습니다.", ephemeral=True)
+        await self.finish(
+            interaction,
+            recruitment,
+            title="❌ 거절됨",
+            color=STOP_COLOR,
+            notice=f"<@{self.applicant_id}> 신청을 거절했습니다.",
+        )
+        await interaction.followup.send("신청을 거절했습니다.", ephemeral=True)
+
+    async def finish(
+        self,
+        interaction: discord.Interaction,
+        recruitment,
+        *,
+        title: str,
+        color: int,
+        notice: str,
+    ) -> None:
+        self.disable_buttons()
+        embed = self.cog.build_application_manage_embed(
+            recruitment,
+            applicant_id=self.applicant_id,
+            application_reason=self.application_reason,
+            title=title,
+            color=color,
+            decided_by=interaction.user.mention,
+            notice=notice,
+        )
+        if interaction.message is not None:
+            await interaction.message.edit(embed=embed, view=self)
 
 
 class RecruitmentModal(discord.ui.Modal, title="팀원 모집"):
@@ -801,8 +789,43 @@ class RecruitmentCog(commands.Cog):
             return fetched
         return None
 
+    async def get_recruitment_thread(self, recruitment, guild: discord.Guild | None) -> discord.Thread | None:
+        """모집에 연결된 Thread를 guild cache에서 먼저 찾고, 없으면 API로 조회합니다."""
+        thread_id = recruitment["thread_id"]
+        if thread_id is None:
+            return None
+
+        if guild is not None:
+            thread = guild.get_thread(int(thread_id))
+            if thread is not None:
+                return thread
+
+        return await self.fetch_private_thread(int(thread_id))
+
+    async def add_member_to_private_thread(self, guild: discord.Guild, thread: discord.Thread, user_id: int) -> str | None:
+        """user_id를 정확한 Member 객체로 조회한 뒤 비공개 스레드에 초대합니다."""
+        try:
+            member = await guild.fetch_member(int(user_id))
+        except discord.NotFound:
+            return "신청자를 서버 멤버 목록에서 찾을 수 없어 비공개 워크스페이스에 초대하지 못했습니다."
+        except discord.Forbidden:
+            return "봇에게 서버 멤버 조회 권한이 없어 비공개 워크스페이스에 초대하지 못했습니다."
+        except discord.HTTPException as exc:
+            return f"서버 멤버 조회 중 오류가 발생해 비공개 워크스페이스에 초대하지 못했습니다: {exc.text}"
+
+        try:
+            await thread.add_user(member)
+        except discord.Forbidden:
+            return "비공개 스레드 초대 권한이 없어 워크스페이스에 자동 초대하지 못했습니다. Manage Threads 권한을 확인해 주세요."
+        except discord.HTTPException as exc:
+            return f"비공개 스레드 초대에 실패했습니다: {exc.text}"
+        return None
+
     async def add_user_to_private_thread(self, thread: discord.Thread, user: discord.abc.Snowflake) -> str | None:
         """비공개 스레드에 사용자를 초대하고 실패 사유를 사용자에게 보여줄 문구로 반환합니다."""
+        if not isinstance(user, discord.Member):
+            return await self.add_member_to_private_thread(thread.guild, thread, int(user.id))
+
         try:
             await thread.add_user(user)
         except discord.Forbidden:
@@ -917,22 +940,27 @@ class RecruitmentCog(commands.Cog):
         """Embed 표시용 현재 참가자(owner + accepted)를 DB에서 직접 조회합니다."""
         return await self.recruitment_service.get_confirmed_participants(recruitment_id)
 
-    async def get_pending_participants(self, recruitment_id: int) -> list:
-        """관리 UI에 표시할 pending 신청자 목록을 가져옵니다."""
-        return await self.recruitment_service.get_pending_participants(recruitment_id)
-
-    def build_participant_management_embed(self, recruitment, pending_rows: list, selected=None, notice: str | None = None) -> discord.Embed:
-        """작성자 관리 화면용 Embed를 만듭니다."""
-        description = notice or "승인하거나 거절할 신청자를 선택하세요."
-        embed = base_embed("신청자 관리", description, color=WARNING_COLOR)
+    def build_application_manage_embed(
+        self,
+        recruitment,
+        *,
+        applicant_id: int,
+        application_reason: str,
+        applicant_mention: str | None = None,
+        title: str = "새로운 참가 신청",
+        color: int = WARNING_COLOR,
+        decided_by: str | None = None,
+        notice: str | None = None,
+    ) -> discord.Embed:
+        """비공개 워크스페이스에 남길 개별 신청 관리 Embed를 만듭니다."""
+        embed = base_embed(title, "비공개 워크스페이스에서 참가 신청을 검토하세요.", color=color)
         embed.add_field(name="모집", value=str(recruitment["title"]), inline=False)
-        embed.add_field(name="대기 중", value=f"{len(pending_rows)}명", inline=True)
-        if selected is not None:
-            reason = str(selected["application_reason"] or "신청 사유 없음")
-            embed.add_field(name="선택한 신청자", value=f"<@{selected['user_id']}>", inline=True)
-            embed.add_field(name="신청 사유", value=reason[:1024], inline=False)
-        elif not pending_rows:
-            embed.add_field(name="대기 중인 신청자", value="없음", inline=False)
+        embed.add_field(name="신청자", value=applicant_mention or f"<@{applicant_id}>", inline=True)
+        embed.add_field(name="신청 사유", value=(application_reason or "작성되지 않음")[:1024], inline=False)
+        if decided_by is not None:
+            embed.add_field(name="처리자", value=decided_by, inline=True)
+        if notice is not None:
+            embed.add_field(name="처리 결과", value=notice[:1024], inline=False)
         return embed
 
     async def notify_recruitment_owner(self, recruitment, applicant: discord.abc.User, reason: str) -> str | None:
