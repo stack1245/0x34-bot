@@ -197,6 +197,19 @@ class RecruitmentService(BaseService):
     async def get_confirmed_participant_user_ids(self, recruitment_id: int) -> list[int]:
         return [int(row["user_id"]) for row in await self.get_confirmed_participants(recruitment_id)]
 
+    async def get_pending_participant_count(self, recruitment_id: int) -> int:
+        row = await self.database.fetch_one(
+            """
+            SELECT COUNT(*) AS pending_count
+            FROM recruitment_participants
+            WHERE recruitment_id = ? AND status = ?
+            """,
+            (recruitment_id, PARTICIPANT_PENDING),
+        )
+        if row is None:
+            return 0
+        return int(row["pending_count"])
+
     async def get_pending_participants(self, recruitment_id: int) -> list[dict[str, Any]]:
         recruitment = await self.get_recruitment_by_id(recruitment_id)
         if recruitment is None:

@@ -289,12 +289,14 @@ class RecruitmentApplicationModal(discord.ui.Modal, title="모집 신청"):
             PARTICIPANT_PENDING,
             application_reason=reason,
         )
-        await self.cog.edit_recruitment_message(int(recruitment["channel_id"]), int(recruitment["message_id"]))
+        message_notice = await self.cog.edit_recruitment_message(int(recruitment["channel_id"]), int(recruitment["message_id"]))
 
         thread = await self.cog.get_recruitment_thread(recruitment, interaction.guild)
         if thread is None:
             notice = await self.cog.notify_recruitment_owner(recruitment, interaction.user, reason)
             message = "신청은 접수되었지만 연결된 비공개 워크스페이스를 찾지 못했습니다."
+            if message_notice:
+                message += f"\n{message_notice}"
             if notice:
                 message += f"\n{notice}"
             await interaction.followup.send(message, ephemeral=True)
@@ -315,13 +317,22 @@ class RecruitmentApplicationModal(discord.ui.Modal, title="모집 신청"):
         try:
             await thread.send(embed=application_embed, view=application_view)
         except discord.Forbidden:
-            await interaction.followup.send("신청은 접수되었지만 비공개 워크스페이스에 알림을 보낼 권한이 없습니다.", ephemeral=True)
+            message = "신청은 접수되었지만 비공개 워크스페이스에 알림을 보낼 권한이 없습니다."
+            if message_notice:
+                message += f"\n{message_notice}"
+            await interaction.followup.send(message, ephemeral=True)
             return
         except discord.HTTPException as exc:
-            await interaction.followup.send(f"신청은 접수되었지만 비공개 워크스페이스 알림 전송에 실패했습니다: {exc.text}", ephemeral=True)
+            message = f"신청은 접수되었지만 비공개 워크스페이스 알림 전송에 실패했습니다: {exc.text}"
+            if message_notice:
+                message += f"\n{message_notice}"
+            await interaction.followup.send(message, ephemeral=True)
             return
 
-        await interaction.followup.send("신청이 접수되었습니다. 작성자의 승인을 기다려 주세요.", ephemeral=True)
+        message = "신청이 접수되었습니다. 작성자의 승인을 기다려 주세요."
+        if message_notice:
+            message += f"\n{message_notice}"
+        await interaction.followup.send(message, ephemeral=True)
 
 
 class ApplicationManageView(discord.ui.View):
@@ -365,7 +376,7 @@ class ApplicationManageView(discord.ui.View):
                 return
 
         await self.cog.save_participant_status(self.recruitment_id, self.applicant_id, PARTICIPANT_ACCEPTED)
-        await self.cog.edit_recruitment_message(int(recruitment["channel_id"]), int(recruitment["message_id"]))
+        message_notice = await self.cog.edit_recruitment_message(int(recruitment["channel_id"]), int(recruitment["message_id"]))
 
         thread = await self.cog.get_recruitment_thread(recruitment, interaction.guild)
         invite_notice = "연결된 비공개 워크스페이스를 찾지 못해 스레드 초대는 건너뛰었습니다."
@@ -373,15 +384,18 @@ class ApplicationManageView(discord.ui.View):
             invite_notice = await self.cog.add_member_to_private_thread(interaction.guild, thread, self.applicant_id)
             if invite_notice is None:
                 invite_notice = f"<@{self.applicant_id}> 님을 비공개 워크스페이스에 초대했습니다."
+        notice = invite_notice
+        if message_notice:
+            notice += f"\n{message_notice}"
 
         await self.finish(
             interaction,
             recruitment,
             title="✅ 승인 완료",
             color=SUCCESS_COLOR,
-            notice=invite_notice,
+            notice=notice,
         )
-        await interaction.followup.send(invite_notice, ephemeral=True)
+        await interaction.followup.send(notice, ephemeral=True)
 
     @discord.ui.button(label="❌ 거절", style=discord.ButtonStyle.danger, custom_id="0x34:recruitment:application:reject")
     async def reject(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
@@ -393,15 +407,18 @@ class ApplicationManageView(discord.ui.View):
             return
 
         await self.cog.save_participant_status(self.recruitment_id, self.applicant_id, PARTICIPANT_REJECTED)
-        await self.cog.edit_recruitment_message(int(recruitment["channel_id"]), int(recruitment["message_id"]))
+        message_notice = await self.cog.edit_recruitment_message(int(recruitment["channel_id"]), int(recruitment["message_id"]))
+        notice = f"<@{self.applicant_id}> 신청을 거절했습니다."
+        if message_notice:
+            notice += f"\n{message_notice}"
         await self.finish(
             interaction,
             recruitment,
             title="❌ 거절됨",
             color=STOP_COLOR,
-            notice=f"<@{self.applicant_id}> 신청을 거절했습니다.",
+            notice=notice,
         )
-        await interaction.followup.send("신청을 거절했습니다.", ephemeral=True)
+        await interaction.followup.send(notice, ephemeral=True)
 
     async def finish(
         self,
@@ -940,6 +957,10 @@ class RecruitmentCog(commands.Cog):
         """Embed 표시용 현재 참가자(owner + accepted)를 DB에서 직접 조회합니다."""
         return await self.recruitment_service.get_confirmed_participants(recruitment_id)
 
+    async def get_pending_participant_count(self, recruitment_id: int) -> int:
+        """Embed 표시용 신청 대기 인원을 DB에서 직접 조회합니다."""
+        return await self.recruitment_service.get_pending_participant_count(recruitment_id)
+
     def build_application_manage_embed(
         self,
         recruitment,
@@ -1016,7 +1037,7 @@ class RecruitmentCog(commands.Cog):
             return base_embed("모집 정보를 찾을 수 없습니다.", color=STOP_COLOR)
 
         confirmed = await self.get_confirmed_participants(int(recruitment["id"]))
-        pending = [row for row in recruitment["participants"] if row["status"] == PARTICIPANT_PENDING]
+        pending_count = await self.get_pending_participant_count(int(recruitment["id"]))
         participant_lines: list[str] = []
         seen_user_ids: set[int] = set()
         for row in confirmed:
@@ -1042,7 +1063,7 @@ class RecruitmentCog(commands.Cog):
         if recruitment["thread_id"]:
             embed.add_field(name="비공개 워크스페이스", value=f"<#{recruitment['thread_id']}>", inline=False)
         embed.add_field(name="참가자", value=_trim_text(participant_text, 1024), inline=False)
-        embed.add_field(name="신청 대기", value=f"{len(pending)}명", inline=True)
+        embed.add_field(name="신청 대기", value=f"{pending_count}명", inline=True)
         return embed
 
     @app_commands.command(name="모집", description="팀원 모집 Embed와 참가 버튼을 생성합니다.")
