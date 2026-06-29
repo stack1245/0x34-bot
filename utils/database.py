@@ -59,6 +59,18 @@ SCHEMA: tuple[str, ...] = (
     )
     """,
     """
+    CREATE TABLE IF NOT EXISTS recruitment_participants (
+        recruitment_id INTEGER NOT NULL,
+        user_id INTEGER NOT NULL,
+        status TEXT NOT NULL CHECK(status IN ('pending', 'accepted', 'rejected', 'owner')),
+        application_reason TEXT,
+        rejection_reason TEXT,
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (recruitment_id, user_id),
+        FOREIGN KEY (recruitment_id) REFERENCES recruitments(id) ON DELETE CASCADE
+    )
+    """,
+    """
     CREATE TABLE IF NOT EXISTS dashboard_state (
         name TEXT PRIMARY KEY,
         board_channel_id INTEGER,
@@ -100,6 +112,39 @@ class Database:
         columns = {row[1] for row in await cursor.fetchall()}
         if "thread_id" not in columns:
             await connection.execute("ALTER TABLE recruitments ADD COLUMN thread_id INTEGER")
+
+        cursor = await connection.execute("PRAGMA table_info(recruitment_participants)")
+        participant_columns = {row[1] for row in await cursor.fetchall()}
+        if "status" not in participant_columns:
+            await connection.execute("ALTER TABLE recruitment_participants ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'")
+        if "application_reason" not in participant_columns:
+            await connection.execute("ALTER TABLE recruitment_participants ADD COLUMN application_reason TEXT")
+        if "rejection_reason" not in participant_columns:
+            await connection.execute("ALTER TABLE recruitment_participants ADD COLUMN rejection_reason TEXT")
+        if "updated_at" not in participant_columns:
+            await connection.execute("ALTER TABLE recruitment_participants ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''")
+
+        await connection.execute(
+            """
+            INSERT OR IGNORE INTO recruitment_participants (recruitment_id, user_id, status, updated_at)
+            SELECT id, author_id, 'owner', created_at
+            FROM recruitments
+            """,
+        )
+        await connection.execute(
+            """
+            INSERT OR IGNORE INTO recruitment_participants (recruitment_id, user_id, status, updated_at)
+            SELECT recruitment_id, user_id,
+                CASE state
+                    WHEN 'join' THEN 'accepted'
+                    WHEN 'wait' THEN 'pending'
+                    WHEN 'decline' THEN 'rejected'
+                    ELSE 'pending'
+                END,
+                updated_at
+            FROM recruitment_votes
+            """,
+        )
 
     async def close(self) -> None:
         """봇 종료 시 DB 연결을 닫습니다."""
