@@ -1,6 +1,4 @@
 from __future__ import annotations
-
-import asyncio
 import json
 import logging
 import re
@@ -11,22 +9,26 @@ from discord.ext import commands
 from google.api_core import exceptions
 
 from services.ai import AIRequest
+from services.recruitment import (
+    CreateRecruitmentRequest,
+    RecruitmentService,
+    PARTICIPANT_ACCEPTED,
+    PARTICIPANT_OWNER,
+    PARTICIPANT_PENDING,
+    PARTICIPANT_REJECTED,
+    STATUS_CLOSED,
+    STATUS_OPEN,
+)
 from utils.ai_input import (
     CONVERSATIONAL_INPUT_INSTRUCTION,
     ScrapingError,
     prepare_conversational_source_text,
     trim_text as _trim_text,
 )
-from utils.datetime import get_current_time_context, now_utc_iso
-from utils.embeds import STOP_COLOR, SUCCESS_COLOR, WARNING_COLOR, base_embed, mention_list
+from utils.datetime import get_current_time_context
+from utils.embeds import STOP_COLOR, SUCCESS_COLOR, WARNING_COLOR, base_embed
 
 
-STATUS_OPEN = "open"
-STATUS_CLOSED = "closed"
-PARTICIPANT_PENDING = "pending"
-PARTICIPANT_ACCEPTED = "accepted"
-PARTICIPANT_REJECTED = "rejected"
-PARTICIPANT_OWNER = "owner"
 DEFAULT_AI_RECRUITMENT_CAPACITY = 4
 MAX_AI_TITLE_LENGTH = 50
 MAX_EMBED_DESCRIPTION_LENGTH = 3900
@@ -168,8 +170,8 @@ class RecruitmentView(discord.ui.View):
         recruitment = await self.get_open_recruitment(interaction)
         if recruitment is None:
             return
-        if interaction.user.id == recruitment["author_id"]:
-            await interaction.response.send_message("작성자는 이미 모집 소유자로 등록되어 있습니다.", ephemeral=True)
+        if await self.cog.is_recruitment_owner(recruitment["id"], interaction.user.id):
+            await interaction.response.send_message("본인이 생성한 모집에는 신청할 수 없습니다.", ephemeral=True)
             return
 
         existing = await self.cog.get_participant(recruitment["id"], interaction.user.id)
@@ -188,8 +190,8 @@ class RecruitmentView(discord.ui.View):
         recruitment = await self.get_open_recruitment(interaction)
         if recruitment is None:
             return
-        if interaction.user.id != recruitment["author_id"]:
-            await interaction.response.send_message("모집 작성자만 신청자를 관리할 수 있습니다.", ephemeral=True)
+        if not await self.cog.is_recruitment_owner(recruitment["id"], interaction.user.id):
+            await interaction.response.send_message("모집 소유자만 신청자를 관리할 수 있습니다.", ephemeral=True)
             return
 
         pending_rows = await self.cog.get_pending_participants(recruitment["id"])
@@ -208,25 +210,22 @@ class RecruitmentView(discord.ui.View):
         if recruitment is None:
             await interaction.response.send_message("DB에서 모집 정보를 찾을 수 없습니다.", ephemeral=True)
             return
-        if interaction.user.id != recruitment["author_id"]:
-            await interaction.response.send_message("모집 작성자만 마감할 수 있습니다.", ephemeral=True)
+        if not await self.cog.is_recruitment_owner(recruitment["id"], interaction.user.id):
+            await interaction.response.send_message("모집 소유자만 마감할 수 있습니다.", ephemeral=True)
             return
         if recruitment["status"] == STATUS_CLOSED:
             await interaction.response.send_message("이미 마감된 모집입니다.", ephemeral=True)
             return
 
         await interaction.response.defer(ephemeral=True, thinking=True)
-        await self.cog.bot.database.execute(
-            "UPDATE recruitments SET status = ?, closed_at = ? WHERE id = ?",
-            (STATUS_CLOSED, now_utc_iso(), recruitment["id"]),
-        )
+        await self.cog.recruitment_service.close_recruitment(int(recruitment["id"]))
 
         embed = await self.cog.build_recruitment_embed(recruitment["message_id"])
         await interaction.edit_original_response(embed=embed, view=self)
 
         thread, thread_notice = await self.cog.ensure_private_workspace_thread(recruitment, interaction, interaction.message)
-        accepted = await self.cog.get_participant_user_ids(recruitment["id"], PARTICIPANT_ACCEPTED)
-        mentions = " ".join(f"<@{user_id}>" for user_id in accepted) or "승인된 참가자가 없습니다."
+        confirmed = await self.cog.get_confirmed_participant_user_ids(recruitment["id"])
+        mentions = " ".join(f"<@{user_id}>" for user_id in confirmed) or "참가자가 없습니다."
 
         if thread is None:
             await interaction.followup.send(
@@ -236,7 +235,7 @@ class RecruitmentView(discord.ui.View):
             )
             return
 
-        for user_id in accepted:
+        for user_id in confirmed:
             await self.cog.add_user_to_private_thread(thread, discord.Object(id=user_id))
 
         await thread.send(f"모집이 마감되었습니다.\n참가 인원: {mentions}")
@@ -269,6 +268,9 @@ class RecruitmentApplicationModal(discord.ui.Modal, title="모집 신청"):
             return
         if recruitment["status"] == STATUS_CLOSED:
             await interaction.followup.send("이미 마감된 모집입니다.", ephemeral=True)
+            return
+        if await self.cog.is_recruitment_owner(self.recruitment_id, interaction.user.id):
+            await interaction.followup.send("본인이 생성한 모집에는 신청할 수 없습니다.", ephemeral=True)
             return
 
         reason = str(self.reason_input.value).strip()
@@ -352,9 +354,9 @@ class ManageParticipantsView(discord.ui.View):
                 child.disabled = selected_user_id is None
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
-        if interaction.user.id == self.owner_id:
+        if await self.cog.is_recruitment_owner(self.recruitment_id, interaction.user.id):
             return True
-        await interaction.response.send_message("모집 작성자만 신청자를 관리할 수 있습니다.", ephemeral=True)
+        await interaction.response.send_message("모집 소유자만 신청자를 관리할 수 있습니다.", ephemeral=True)
         return False
 
     @discord.ui.button(label="승인", style=discord.ButtonStyle.success, custom_id="0x34:recruitment:approve")
@@ -371,8 +373,8 @@ class ManageParticipantsView(discord.ui.View):
             return
 
         if recruitment["max_members"] > 0:
-            accepted = await self.cog.get_participant_user_ids(self.recruitment_id, PARTICIPANT_ACCEPTED)
-            if self.selected_user_id not in accepted and len(accepted) >= recruitment["max_members"]:
+            confirmed = await self.cog.get_confirmed_participant_user_ids(self.recruitment_id)
+            if self.selected_user_id not in confirmed and len(confirmed) >= recruitment["max_members"]:
                 await interaction.edit_original_response(content="정원이 이미 찼습니다.", embed=None, view=None)
                 return
 
@@ -414,8 +416,8 @@ class RejectParticipantModal(discord.ui.Modal, title="신청 거절"):
         self.user_id = user_id
 
     async def on_submit(self, interaction: discord.Interaction) -> None:
-        if interaction.user.id != self.owner_id:
-            await interaction.response.send_message("모집 작성자만 신청자를 관리할 수 있습니다.", ephemeral=True)
+        if not await self.cog.is_recruitment_owner(self.recruitment_id, interaction.user.id):
+            await interaction.response.send_message("모집 소유자만 신청자를 관리할 수 있습니다.", ephemeral=True)
             return
 
         await interaction.response.defer(ephemeral=True, thinking=True)
@@ -648,6 +650,7 @@ class RecruitmentCog(commands.Cog):
 
     def __init__(self, bot: commands.Bot) -> None:
         self.bot = bot
+        self.recruitment_service = RecruitmentService(self.bot.database)
         self.bot.add_view(RecruitmentView(self))
 
     async def resolve_recruitment_channel(self, interaction: discord.Interaction) -> discord.abc.Messageable:
@@ -697,33 +700,21 @@ class RecruitmentCog(commands.Cog):
         else:
             message = await channel.send(embed=placeholder, view=view)
 
-        cursor = await self.bot.database.execute(
-            """
-            INSERT INTO recruitments (guild_id, channel_id, message_id, author_id, title, target, max_members, status, thread_id, created_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                interaction.guild.id,
-                message.channel.id,
-                message.id,
-                interaction.user.id,
-                title,
-                target,
-                max_members,
-                STATUS_OPEN,
-                None,
-                now_utc_iso(),
-            ),
+        recruitment_id = await self.recruitment_service.create_recruitment(
+            CreateRecruitmentRequest(
+                guild_id=interaction.guild.id,
+                channel_id=message.channel.id,
+                message_id=message.id,
+                author_id=interaction.user.id,
+                title=title,
+                target=target,
+                max_members=max_members,
+            )
         )
-        recruitment_id = int(cursor.lastrowid)
-        await self.save_participant_status(recruitment_id, interaction.user.id, PARTICIPANT_OWNER)
 
         thread, thread_notice = await self.create_private_workspace_thread(interaction, channel, title, message)
         if thread is not None:
-            await self.bot.database.execute(
-                "UPDATE recruitments SET thread_id = ? WHERE id = ?",
-                (thread.id, recruitment_id),
-            )
+            await self.recruitment_service.update_thread_id(recruitment_id, thread.id)
 
         embed = await self.build_recruitment_embed(message.id)
         await message.edit(embed=embed, view=RecruitmentView(self))
@@ -793,10 +784,7 @@ class RecruitmentCog(commands.Cog):
 
         thread, notice = await self.create_private_workspace_thread(interaction, source_message.channel, recruitment["title"], source_message)
         if thread is not None:
-            await self.bot.database.execute(
-                "UPDATE recruitments SET thread_id = ? WHERE id = ?",
-                (thread.id, recruitment["id"]),
-            )
+            await self.recruitment_service.update_thread_id(int(recruitment["id"]), thread.id)
         return thread, notice
 
     async def fetch_private_thread(self, thread_id: int) -> discord.Thread | None:
@@ -884,28 +872,16 @@ class RecruitmentCog(commands.Cog):
         )
 
     async def get_recruitment(self, message_id: int):
-        """메시지 ID로 모집 레코드를 찾습니다."""
-        return await self.bot.database.fetch_one(
-            "SELECT * FROM recruitments WHERE message_id = ?",
-            (message_id,),
-        )
+        """메시지 ID로 owner가 포함된 모집 레코드를 찾습니다."""
+        return await self.recruitment_service.get_recruitment_by_message_id(message_id)
 
     async def get_recruitment_by_id(self, recruitment_id: int):
-        """모집 ID로 모집 레코드를 찾습니다."""
-        return await self.bot.database.fetch_one(
-            "SELECT * FROM recruitments WHERE id = ?",
-            (recruitment_id,),
-        )
+        """모집 ID로 owner가 포함된 모집 레코드를 찾습니다."""
+        return await self.recruitment_service.get_recruitment_by_id(recruitment_id)
 
     async def get_participant(self, recruitment_id: int, user_id: int):
         """특정 모집의 신청자 상태를 가져옵니다."""
-        return await self.bot.database.fetch_one(
-            """
-            SELECT * FROM recruitment_participants
-            WHERE recruitment_id = ? AND user_id = ?
-            """,
-            (recruitment_id, user_id),
-        )
+        return await self.recruitment_service.get_participant(recruitment_id, user_id)
 
     async def save_participant_status(
         self,
@@ -917,43 +893,29 @@ class RecruitmentCog(commands.Cog):
         rejection_reason: str | None = None,
     ) -> None:
         """신청자 상태를 upsert합니다."""
-        await self.bot.database.execute(
-            """
-            INSERT INTO recruitment_participants (recruitment_id, user_id, status, application_reason, rejection_reason, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?)
-            ON CONFLICT(recruitment_id, user_id)
-            DO UPDATE SET
-                status = excluded.status,
-                application_reason = COALESCE(excluded.application_reason, recruitment_participants.application_reason),
-                rejection_reason = COALESCE(excluded.rejection_reason, recruitment_participants.rejection_reason),
-                updated_at = excluded.updated_at
-            """,
-            (recruitment_id, user_id, status, application_reason, rejection_reason, now_utc_iso()),
+        await self.recruitment_service.save_participant_status(
+            recruitment_id,
+            user_id,
+            status,
+            application_reason=application_reason,
+            rejection_reason=rejection_reason,
         )
+
+    async def is_recruitment_owner(self, recruitment_id: int, user_id: int) -> bool:
+        """DB의 participant status=owner를 기준으로 모집 소유자 권한을 확인합니다."""
+        return await self.recruitment_service.is_owner(recruitment_id, user_id)
 
     async def get_participant_user_ids(self, recruitment_id: int, status: str) -> list[int]:
         """특정 신청 상태인 유저 ID 목록을 가져옵니다."""
-        rows = await self.bot.database.fetch_all(
-            """
-            SELECT user_id FROM recruitment_participants
-            WHERE recruitment_id = ? AND status = ?
-            ORDER BY updated_at ASC
-            """,
-            (recruitment_id, status),
-        )
-        return [int(row["user_id"]) for row in rows]
+        return await self.recruitment_service.get_participant_user_ids(recruitment_id, status)
+
+    async def get_confirmed_participant_user_ids(self, recruitment_id: int) -> list[int]:
+        """owner와 accepted를 함께 현재 참가자로 계산합니다."""
+        return await self.recruitment_service.get_confirmed_participant_user_ids(recruitment_id)
 
     async def get_pending_participants(self, recruitment_id: int) -> list:
         """관리 UI에 표시할 pending 신청자 목록을 가져옵니다."""
-        return await self.bot.database.fetch_all(
-            """
-            SELECT user_id, application_reason, updated_at FROM recruitment_participants
-            WHERE recruitment_id = ? AND status = ?
-            ORDER BY updated_at ASC
-            LIMIT 25
-            """,
-            (recruitment_id, PARTICIPANT_PENDING),
-        )
+        return await self.recruitment_service.get_pending_participants(recruitment_id)
 
     def build_participant_management_embed(self, recruitment, pending_rows: list, selected=None, notice: str | None = None) -> discord.Embed:
         """작성자 관리 화면용 Embed를 만듭니다."""
@@ -999,7 +961,7 @@ class RecruitmentCog(commands.Cog):
                 return "저장된 채널에서 모집 메시지를 가져올 수 없어 Discord 메시지는 수정하지 못했습니다."
 
             message = await channel.fetch_message(int(message_id))
-            embed = await self.build_recruitment_embed(int(message_id))
+            embed = await self.update_recruitment_embed(int(message_id))
             await message.edit(embed=embed, view=RecruitmentView(self))
         except (TypeError, ValueError):
             return "저장된 채널 또는 메시지 ID가 올바르지 않아 Discord 메시지는 수정하지 못했습니다."
@@ -1012,26 +974,43 @@ class RecruitmentCog(commands.Cog):
         return None
 
     async def build_recruitment_embed(self, message_id: int) -> discord.Embed:
+        """Backward-compatible wrapper for older call sites."""
+        return await self.update_recruitment_embed(message_id)
+
+    async def update_recruitment_embed(self, message_id: int) -> discord.Embed:
         """현재 DB 상태를 읽어 모집 Embed를 다시 만듭니다."""
         recruitment = await self.get_recruitment(message_id)
         if recruitment is None:
             return base_embed("모집 정보를 찾을 수 없습니다.", color=STOP_COLOR)
 
-        accepted = await self.get_participant_user_ids(recruitment["id"], PARTICIPANT_ACCEPTED)
-        pending = await self.get_participant_user_ids(recruitment["id"], PARTICIPANT_PENDING)
+        participants = list(recruitment["participants"])
+        confirmed = [row for row in participants if row["status"] in {PARTICIPANT_OWNER, PARTICIPANT_ACCEPTED}]
+        pending = [row for row in participants if row["status"] == PARTICIPANT_PENDING]
+        participant_lines: list[str] = []
+        seen_user_ids: set[int] = set()
+        for row in confirmed:
+            user_id = int(row["user_id"])
+            if user_id in seen_user_ids:
+                continue
+            seen_user_ids.add(user_id)
+            if row["status"] == PARTICIPANT_OWNER:
+                participant_lines.append(f"👑 <@{user_id}> [팀장]")
+            else:
+                participant_lines.append(f"<@{user_id}>")
 
         status_text = "모집 중" if recruitment["status"] == STATUS_OPEN else "모집 마감"
         color = SUCCESS_COLOR if recruitment["status"] == STATUS_OPEN else WARNING_COLOR
         max_members = recruitment["max_members"]
-        capacity = "제한 없음" if max_members == 0 else f"{len(accepted)} / {max_members}"
+        capacity = f"{len(seen_user_ids)}명 / 제한 없음" if max_members == 0 else f"{len(seen_user_ids)} / {max_members}"
+        participant_text = "\n".join(participant_lines) or "없음"
 
         embed = base_embed(str(recruitment["title"]), str(recruitment["target"]), color=color)
         embed.add_field(name="상태", value=status_text, inline=True)
-        embed.add_field(name="정원", value=capacity, inline=True)
+        embed.add_field(name="현재 인원", value=capacity, inline=True)
         embed.add_field(name="작성자", value=f"<@{recruitment['author_id']}>", inline=True)
         if recruitment["thread_id"]:
             embed.add_field(name="비공개 워크스페이스", value=f"<#{recruitment['thread_id']}>", inline=False)
-        embed.add_field(name="참가자", value=mention_list(accepted), inline=False)
+        embed.add_field(name="참가자", value=_trim_text(participant_text, 1024), inline=False)
         embed.add_field(name="신청 대기", value=f"{len(pending)}명", inline=True)
         return embed
 

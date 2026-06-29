@@ -23,6 +23,7 @@ Team 0x34 운영을 위한 `discord.py` 기반 Discord 봇입니다. Slash Comma
 │   ├── ai.py
 │   ├── base.py
 │   ├── error_handler.py
+│   ├── recruitment.py
 │   └── state_manager.py
 ├── repositories/
 │   ├── __init__.py
@@ -70,6 +71,7 @@ flowchart TD
 
 - `services.base.BaseService`: 서비스 레이어 공통 로깅과 `run_safely()` 실패 격리
 - `services.state_manager.StateManager`: `dashboard_state`를 재시작 후에도 복구하는 단일 메시지 상태 관리자
+- `services.recruitment.RecruitmentService`: 모집 생성과 작성자 owner 참가자 등록을 하나의 트랜잭션으로 묶고, 모집 조회 시 owner가 포함된 참가자 목록을 보장하는 도메인 서비스
 - `services.ai.AIProvider`: Gemini Flash/Pro 또는 다른 모델로 교체 가능한 AI 호출 인터페이스
 - `repositories.base.Repository`: `execute/fetch_one/fetch_all` 기반 비동기 저장소 계약
 - `services.error_handler.BotErrorHandler`: Slash Command, 텍스트 명령, 이벤트 예외를 중앙 처리하는 graceful degradation 계층
