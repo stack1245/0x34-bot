@@ -913,6 +913,10 @@ class RecruitmentCog(commands.Cog):
         """owner와 accepted를 함께 현재 참가자로 계산합니다."""
         return await self.recruitment_service.get_confirmed_participant_user_ids(recruitment_id)
 
+    async def get_confirmed_participants(self, recruitment_id: int) -> list[dict]:
+        """Embed 표시용 현재 참가자(owner + accepted)를 DB에서 직접 조회합니다."""
+        return await self.recruitment_service.get_confirmed_participants(recruitment_id)
+
     async def get_pending_participants(self, recruitment_id: int) -> list:
         """관리 UI에 표시할 pending 신청자 목록을 가져옵니다."""
         return await self.recruitment_service.get_pending_participants(recruitment_id)
@@ -983,9 +987,8 @@ class RecruitmentCog(commands.Cog):
         if recruitment is None:
             return base_embed("모집 정보를 찾을 수 없습니다.", color=STOP_COLOR)
 
-        participants = list(recruitment["participants"])
-        confirmed = [row for row in participants if row["status"] in {PARTICIPANT_OWNER, PARTICIPANT_ACCEPTED}]
-        pending = [row for row in participants if row["status"] == PARTICIPANT_PENDING]
+        confirmed = await self.get_confirmed_participants(int(recruitment["id"]))
+        pending = [row for row in recruitment["participants"] if row["status"] == PARTICIPANT_PENDING]
         participant_lines: list[str] = []
         seen_user_ids: set[int] = set()
         for row in confirmed:

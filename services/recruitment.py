@@ -163,15 +163,39 @@ class RecruitmentService(BaseService):
             return []
         return [int(row["user_id"]) for row in recruitment["participants"] if row["status"] == status]
 
-    async def get_confirmed_participant_user_ids(self, recruitment_id: int) -> list[int]:
-        recruitment = await self.get_recruitment_by_id(recruitment_id)
+    async def get_confirmed_participants(self, recruitment_id: int) -> list[dict[str, Any]]:
+        recruitment = await self.database.fetch_one(
+            "SELECT author_id, created_at FROM recruitments WHERE id = ?",
+            (recruitment_id,),
+        )
         if recruitment is None:
             return []
-        return [
-            int(row["user_id"])
-            for row in recruitment["participants"]
-            if row["status"] in {PARTICIPANT_OWNER, PARTICIPANT_ACCEPTED}
-        ]
+
+        await self.ensure_owner_participant(
+            recruitment_id,
+            int(recruitment["author_id"]),
+            str(recruitment["created_at"]),
+        )
+        rows = await self.database.fetch_all(
+            """
+            SELECT user_id, status, application_reason, rejection_reason, updated_at
+            FROM recruitment_participants
+            WHERE recruitment_id = ? AND status IN (?, ?)
+            ORDER BY
+                CASE status
+                    WHEN 'owner' THEN 0
+                    WHEN 'accepted' THEN 1
+                    ELSE 2
+                END,
+                updated_at ASC,
+                user_id ASC
+            """,
+            (recruitment_id, PARTICIPANT_OWNER, PARTICIPANT_ACCEPTED),
+        )
+        return [dict(row) for row in rows]
+
+    async def get_confirmed_participant_user_ids(self, recruitment_id: int) -> list[int]:
+        return [int(row["user_id"]) for row in await self.get_confirmed_participants(recruitment_id)]
 
     async def get_pending_participants(self, recruitment_id: int) -> list[dict[str, Any]]:
         recruitment = await self.get_recruitment_by_id(recruitment_id)
