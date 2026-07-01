@@ -149,6 +149,12 @@ class RecruitmentView(discord.ui.View):
         super().__init__(timeout=None)
         self.cog = cog
 
+    def disable_buttons(self) -> None:
+        """현재 모집 메시지의 버튼을 모두 비활성화합니다."""
+        for child in self.children:
+            if isinstance(child, discord.ui.Button):
+                child.disabled = True
+
     async def get_open_recruitment(self, interaction: discord.Interaction):
         """버튼이 눌린 모집 메시지에서 열려 있는 모집 레코드를 찾습니다."""
         if interaction.message is None:
@@ -206,7 +212,7 @@ class RecruitmentView(discord.ui.View):
 
     @discord.ui.button(label="모집 마감", style=discord.ButtonStyle.primary, custom_id="0x34:recruitment:close")
     async def close_recruitment(self, interaction: discord.Interaction, button: discord.ui.Button) -> None:
-        """작성자가 모집을 마감하고 참가자 멘션 및 스레드 생성을 시도합니다."""
+        """작성자가 모집을 마감하고 원본 모집 메시지를 닫힌 상태로 갱신합니다."""
         if interaction.message is None:
             await interaction.response.send_message("모집 메시지를 찾을 수 없습니다.", ephemeral=True)
             return
@@ -222,11 +228,11 @@ class RecruitmentView(discord.ui.View):
             await interaction.response.send_message("이미 마감된 모집입니다.", ephemeral=True)
             return
 
-        await interaction.response.defer(ephemeral=True, thinking=True)
         await self.cog.recruitment_service.close_recruitment(int(recruitment["id"]))
 
-        embed = await self.cog.build_recruitment_embed(recruitment["message_id"])
-        await interaction.edit_original_response(embed=embed, view=self)
+        updated_embed = await self.cog.build_recruitment_embed(recruitment["message_id"])
+        self.disable_buttons()
+        await interaction.response.edit_message(embed=updated_embed, view=self)
 
         thread, thread_notice = await self.cog.ensure_private_workspace_thread(recruitment, interaction, interaction.message)
         confirmed = await self.cog.get_confirmed_participant_user_ids(recruitment["id"])
@@ -234,7 +240,8 @@ class RecruitmentView(discord.ui.View):
 
         if thread is None:
             await interaction.followup.send(
-                "모집은 마감했지만 비공개 스레드를 사용할 수 없어 참가자 멘션은 공개 채널에 보내지 않았습니다.\n"
+                "✅ 모집이 성공적으로 마감되었습니다.\n"
+                "비공개 스레드를 사용할 수 없어 참가자 멘션은 공개 채널에 보내지 않았습니다.\n"
                 f"{thread_notice or '채널 권한과 서버 부스트 레벨을 확인해 주세요.'}",
                 ephemeral=True,
             )
@@ -244,7 +251,7 @@ class RecruitmentView(discord.ui.View):
             await self.cog.add_user_to_private_thread(thread, discord.Object(id=user_id))
 
         await thread.send(f"모집이 마감되었습니다.\n참가 인원: {mentions}")
-        await interaction.followup.send(f"모집을 마감하고 비공개 워크스페이스에 참가자를 안내했습니다: {thread.mention}", ephemeral=True)
+        await interaction.followup.send(f"✅ 모집이 성공적으로 마감되었습니다.\n비공개 워크스페이스에 참가자를 안내했습니다: {thread.mention}", ephemeral=True)
 
 
 class RecruitmentApplicationModal(discord.ui.Modal, title="모집 신청"):
@@ -1050,8 +1057,8 @@ class RecruitmentCog(commands.Cog):
             else:
                 participant_lines.append(f"<@{user_id}>")
 
-        status_text = "모집 중" if recruitment["status"] == STATUS_OPEN else "모집 마감"
-        color = SUCCESS_COLOR if recruitment["status"] == STATUS_OPEN else WARNING_COLOR
+        status_text = "🟢 모집 중" if recruitment["status"] == STATUS_OPEN else "🔴 모집 마감"
+        color = SUCCESS_COLOR if recruitment["status"] == STATUS_OPEN else discord.Color.dark_grey()
         max_members = recruitment["max_members"]
         capacity = f"{len(seen_user_ids)}명 / 제한 없음" if max_members == 0 else f"{len(seen_user_ids)} / {max_members}"
         participant_text = "\n".join(participant_lines) or "없음"
