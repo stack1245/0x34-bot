@@ -37,7 +37,6 @@ SCHEDULE_LOCATION_LINE_PATTERN = re.compile(r"^\*\*장소\*\*\s*(.+)$", re.MULTI
 SCHEDULE_METADATA_LINE_PATTERN = re.compile(r"^\*\*(?:종료|장소)\*\*.*(?:\n|$)", re.MULTILINE)
 MANUAL_SCHEDULE_FALLBACK_FORMATS = (
     "%Y-%m-%d %H:%M",
-    "%Y-%m-%d %H:%M:%S",
     "%Y-%m-%d",
 )
 
@@ -124,7 +123,7 @@ class ScheduleModal(discord.ui.Modal, title="일정 추가"):
                 starts_at, ends_at = self.cog.parse_manual_schedule_datetimes_fallback(str(self.starts_at_input.value))
             except ValueError:
                 await interaction.followup.send(
-                    "⚠️ 현재 봇이 너무 많은 요청을 처리 중입니다. 당분간 `YYYY-MM-DD HH:MM` 형식으로 정확히 입력해 주세요.",
+                    "⚠️ 현재 봇이 너무 많은 요청을 처리 중입니다. 당분간 `YYYY-MM-DD HH:MM` (또는 `~` 로 연결) 형식으로 정확히 입력해 주세요.",
                     ephemeral=True,
                 )
                 return
@@ -135,7 +134,7 @@ class ScheduleModal(discord.ui.Modal, title="일정 추가"):
                 starts_at, ends_at = self.cog.parse_manual_schedule_datetimes_fallback(str(self.starts_at_input.value))
             except ValueError:
                 await interaction.followup.send(
-                    "⚠️ 현재 봇이 너무 많은 요청을 처리 중입니다. 당분간 `YYYY-MM-DD HH:MM` 형식으로 정확히 입력해 주세요.",
+                    "⚠️ 현재 봇이 너무 많은 요청을 처리 중입니다. 당분간 `YYYY-MM-DD HH:MM` (또는 `~` 로 연결) 형식으로 정확히 입력해 주세요.",
                     ephemeral=True,
                 )
                 return
@@ -875,14 +874,26 @@ class ScheduleCog(commands.Cog):
         """AI가 실패했을 때 정해진 날짜 형식만 직접 파싱합니다."""
         text = date_text.strip()
         tzinfo = ZoneInfo(self.bot.settings.timezone)
+
+        if "~" in text:
+            start_str, end_str = (part.strip() for part in text.split("~"))
+        else:
+            start_str = text
+            end_str = text
+
+        starts_at = self.parse_manual_schedule_datetime_fallback_value(start_str, tzinfo)
+        ends_at = self.parse_manual_schedule_datetime_fallback_value(end_str, tzinfo)
+        return starts_at, ends_at
+
+    def parse_manual_schedule_datetime_fallback_value(self, value: str, tzinfo: ZoneInfo) -> datetime:
+        """수동 fallback의 단일 날짜 문자열을 파싱합니다."""
         for input_format in MANUAL_SCHEDULE_FALLBACK_FORMATS:
             try:
-                parsed = datetime.strptime(text, input_format)
+                parsed = datetime.strptime(value, input_format)
             except ValueError:
                 continue
-            starts_at = parsed.replace(tzinfo=tzinfo)
-            return starts_at, starts_at
-        raise ValueError("Manual schedule fallback only accepts YYYY-MM-DD HH:MM or YYYY-MM-DD")
+            return parsed.replace(tzinfo=tzinfo)
+        raise ValueError("Manual schedule fallback only accepts YYYY-MM-DD HH:MM, YYYY-MM-DD, or a ~ range")
 
     async def insert_generated_schedule(
         self,
