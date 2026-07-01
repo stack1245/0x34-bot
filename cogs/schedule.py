@@ -5,6 +5,7 @@ import json
 import logging
 import re
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import discord
 from discord import app_commands
@@ -34,6 +35,11 @@ DISCORD_EVENT_SYNC_KEYWORDS = ("예선", "본선")
 SCHEDULE_END_LINE_PATTERN = re.compile(r"^\*\*종료\*\*\s*<t:(\d+)(?::[tTdDfFR])?>.*$", re.MULTILINE)
 SCHEDULE_LOCATION_LINE_PATTERN = re.compile(r"^\*\*장소\*\*\s*(.+)$", re.MULTILINE)
 SCHEDULE_METADATA_LINE_PATTERN = re.compile(r"^\*\*(?:종료|장소)\*\*.*(?:\n|$)", re.MULTILINE)
+MANUAL_SCHEDULE_FALLBACK_FORMATS = (
+    "%Y-%m-%d %H:%M",
+    "%Y-%m-%d %H:%M:%S",
+    "%Y-%m-%d",
+)
 
 
 SCHEDULE_GENERATION_PROMPT = """
@@ -106,6 +112,7 @@ class ScheduleModal(discord.ui.Modal, title="일정 추가"):
             await interaction.followup.send("서버 안에서만 일정을 추가할 수 있습니다.", ephemeral=True)
             return
 
+        fallback_notice: str | None = None
         try:
             starts_at, ends_at = await self.cog.parse_manual_schedule_datetimes(
                 title=str(self.title_input.value),
@@ -113,12 +120,26 @@ class ScheduleModal(discord.ui.Modal, title="일정 추가"):
                 body=str(self.body_input.value),
             )
         except exceptions.ResourceExhausted:
-            await interaction.followup.send(GEMINI_RATE_LIMIT_MESSAGE, ephemeral=True)
-            return
+            try:
+                starts_at, ends_at = self.cog.parse_manual_schedule_datetimes_fallback(str(self.starts_at_input.value))
+            except ValueError:
+                await interaction.followup.send(
+                    "⚠️ 현재 봇이 너무 많은 요청을 처리 중입니다. 당분간 `YYYY-MM-DD HH:MM` 형식으로 정확히 입력해 주세요.",
+                    ephemeral=True,
+                )
+                return
+            fallback_notice = "⚠️ AI API 지연으로 수동 양식으로 저장되었습니다."
         except Exception:
             logging.exception("Gemini manual schedule datetime parsing failed")
-            await interaction.followup.send("⚠️ 날짜를 이해하지 못했습니다. 조금 더 명확하게 적어주세요.", ephemeral=True)
-            return
+            try:
+                starts_at, ends_at = self.cog.parse_manual_schedule_datetimes_fallback(str(self.starts_at_input.value))
+            except ValueError:
+                await interaction.followup.send(
+                    "⚠️ 현재 봇이 너무 많은 요청을 처리 중입니다. 당분간 `YYYY-MM-DD HH:MM` 형식으로 정확히 입력해 주세요.",
+                    ephemeral=True,
+                )
+                return
+            fallback_notice = "⚠️ AI API 지연으로 수동 양식으로 저장되었습니다."
 
         body = str(self.body_input.value).strip()
         stored_body = body
@@ -159,7 +180,11 @@ class ScheduleModal(discord.ui.Modal, title="일정 추가"):
 
         await self.cog.update_schedule_board()
 
-        await interaction.followup.send(f"✅ 성공적으로 일정이 추가되었습니다.\n{event_status}", ephemeral=True)
+        response = "✅ 성공적으로 일정이 추가되었습니다."
+        if fallback_notice:
+            response += f"\n{fallback_notice}"
+        response += f"\n{event_status}"
+        await interaction.followup.send(response, ephemeral=True)
 
 
 class ScheduleDeleteSelect(discord.ui.Select):
@@ -845,6 +870,19 @@ class ScheduleCog(commands.Cog):
             body=body,
         )
         return self.parse_manual_schedule_datetime_payload(raw_text)
+
+    def parse_manual_schedule_datetimes_fallback(self, date_text: str) -> tuple[datetime, datetime]:
+        """AI가 실패했을 때 정해진 날짜 형식만 직접 파싱합니다."""
+        text = date_text.strip()
+        tzinfo = ZoneInfo(self.bot.settings.timezone)
+        for input_format in MANUAL_SCHEDULE_FALLBACK_FORMATS:
+            try:
+                parsed = datetime.strptime(text, input_format)
+            except ValueError:
+                continue
+            starts_at = parsed.replace(tzinfo=tzinfo)
+            return starts_at, starts_at
+        raise ValueError("Manual schedule fallback only accepts YYYY-MM-DD HH:MM or YYYY-MM-DD")
 
     async def insert_generated_schedule(
         self,
