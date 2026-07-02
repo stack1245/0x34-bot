@@ -13,7 +13,6 @@ from services.error_handler import BotErrorHandler
 from services.state_manager import StateManager
 from utils.database import Database
 
-
 # Cog는 기능 단위 모듈입니다. 새 기능을 추가할 때 여기에 모듈 경로만 더하면 됩니다.
 EXTENSIONS: tuple[str, ...] = (
     "cogs.schedule",
@@ -37,7 +36,9 @@ class Team0x34Bot(commands.Bot):
         self.settings = settings
         self.database = Database(settings.database_path)
         self.state_manager = StateManager(self.database)
-        self.ai_provider = build_ai_provider(api_key=settings.gemini_api_key, model_name=settings.gemini_model)
+        self.ai_provider = build_ai_provider(
+            api_key=settings.gemini_api_key, model_name=settings.gemini_model
+        )
         self.error_handler = BotErrorHandler()
         self.tree.on_error = self.on_app_command_error
         if settings.enable_admin_text_commands:
@@ -72,8 +73,12 @@ class Team0x34Bot(commands.Bot):
             self.tree.add_command(command)
         logging.info("Cleared remote global application commands")
 
-    async def clean_sync_global_application_commands(self) -> list[discord.app_commands.AppCommand]:
+    async def clean_sync_global_application_commands(
+        self, guild: discord.Object | None = None
+    ) -> list[discord.app_commands.AppCommand]:
         """전역 명령을 완전히 지운 뒤 현재 코드에 있는 전역 명령만 다시 등록합니다."""
+        if guild is not None:
+            await self.clear_guild_application_commands(guild)
         await self.clear_global_application_commands()
         synced = await self.tree.sync()
         logging.info("Clean-synced %s global commands", len(synced))
@@ -90,8 +95,11 @@ class Team0x34Bot(commands.Bot):
         await self.tree.sync(guild=guild)
         logging.info("Cleared remote guild application commands for %s", guild.id)
 
-    async def clean_sync_guild_application_commands(self, guild: discord.Object) -> list[discord.app_commands.AppCommand]:
+    async def clean_sync_guild_application_commands(
+        self, guild: discord.Object
+    ) -> list[discord.app_commands.AppCommand]:
         """특정 서버 명령을 완전히 지운 뒤 현재 코드의 명령만 Guild 명령으로 다시 등록합니다."""
+        await self.clear_global_application_commands()
         await self.clear_guild_application_commands(guild)
         self.tree.copy_global_to(guild=guild)
         synced = await self.tree.sync(guild=guild)
@@ -100,27 +108,36 @@ class Team0x34Bot(commands.Bot):
 
     async def sync_application_commands_on_start(self) -> None:
         """환경 변수 조건에 따라 시작 시 Slash Command를 동기화합니다."""
-        guild = discord.Object(id=self.settings.guild_id) if self.settings.guild_id is not None else None
-
-        if self.settings.clear_commands_on_start:
-            # 고스트 커맨드를 확실히 없애려면 전역과 테스트 서버 양쪽을 먼저 비웁니다.
-            # GUILD_ID가 설정된 개발 환경에서는 이후 Guild 명령만 빠르게 재등록합니다.
-            await self.clear_global_application_commands()
-            if guild is not None:
-                await self.clear_guild_application_commands(guild)
+        guild = (
+            discord.Object(id=self.settings.guild_id)
+            if self.settings.guild_id is not None
+            else None
+        )
 
         if guild is not None:
             # 개발 중에는 GUILD_ID를 지정하면 커맨드가 거의 즉시 테스트 서버에 반영됩니다.
+            # 같은 서버에 전역 명령이 남아 있으면 중복 노출되므로 Guild 모드에서는 전역 원격 명령을 먼저 비웁니다.
+            if self.settings.clear_commands_on_start:
+                synced = await self.clean_sync_guild_application_commands(guild)
+                logging.info("Synced %s guild commands to %s", len(synced), guild.id)
+                return
+
+            await self.clear_global_application_commands()
             self.tree.copy_global_to(guild=guild)
             synced = await self.tree.sync(guild=guild)
             logging.info("Synced %s guild commands to %s", len(synced), guild.id)
             return
 
         # 전역 명령 동기화는 모든 서버에 배포할 때 사용합니다. Discord 반영은 최대 1시간 걸릴 수 있습니다.
-        synced = await self.tree.sync()
+        if self.settings.clear_commands_on_start:
+            synced = await self.clean_sync_global_application_commands()
+        else:
+            synced = await self.tree.sync()
         logging.info("Synced %s global commands", len(synced))
 
-    def _resolve_command_guild(self, ctx: commands.Context["Team0x34Bot"]) -> discord.Object | None:
+    def _resolve_command_guild(
+        self, ctx: commands.Context["Team0x34Bot"]
+    ) -> discord.Object | None:
         """관리자 텍스트 명령에서 사용할 Guild를 현재 채널 또는 GUILD_ID로 결정합니다."""
         if ctx.guild is not None:
             return discord.Object(id=ctx.guild.id)
@@ -134,11 +151,15 @@ class Team0x34Bot(commands.Bot):
         @commands.group(name="인증", invoke_without_command=True)
         @commands.is_owner()
         async def auth_group(ctx: commands.Context[Team0x34Bot]) -> None:
-            await ctx.reply("사용법: `!인증 sync [guild|global|all]` 또는 `!인증 clear [guild|global|all]`")
+            await ctx.reply(
+                "사용법: `!인증 sync [guild|global|all]` 또는 `!인증 clear [guild|global|all]`"
+            )
 
         @auth_group.command(name="clear")
         @commands.is_owner()
-        async def clear_commands(ctx: commands.Context[Team0x34Bot], scope: str = "guild") -> None:
+        async def clear_commands(
+            ctx: commands.Context[Team0x34Bot], scope: str = "guild"
+        ) -> None:
             scope = scope.lower()
             if scope not in {"guild", "global", "all"}:
                 await ctx.reply("scope는 `guild`, `global`, `all` 중 하나여야 합니다.")
@@ -146,7 +167,9 @@ class Team0x34Bot(commands.Bot):
 
             guild = self._resolve_command_guild(ctx)
             if scope in {"guild", "all"} and guild is None:
-                await ctx.reply("Guild 명령을 지우려면 서버 채널에서 실행하거나 GUILD_ID를 설정해 주세요.")
+                await ctx.reply(
+                    "Guild 명령을 지우려면 서버 채널에서 실행하거나 GUILD_ID를 설정해 주세요."
+                )
                 return
 
             if scope in {"global", "all"}:
@@ -158,7 +181,9 @@ class Team0x34Bot(commands.Bot):
 
         @auth_group.command(name="sync")
         @commands.is_owner()
-        async def sync_commands(ctx: commands.Context[Team0x34Bot], scope: str = "guild") -> None:
+        async def sync_commands(
+            ctx: commands.Context[Team0x34Bot], scope: str = "guild"
+        ) -> None:
             scope = scope.lower()
             if scope not in {"guild", "global", "all"}:
                 await ctx.reply("scope는 `guild`, `global`, `all` 중 하나여야 합니다.")
@@ -166,18 +191,29 @@ class Team0x34Bot(commands.Bot):
 
             guild = self._resolve_command_guild(ctx)
             if scope in {"guild", "all"} and guild is None:
-                await ctx.reply("Guild 명령을 동기화하려면 서버 채널에서 실행하거나 GUILD_ID를 설정해 주세요.")
+                await ctx.reply(
+                    "Guild 명령을 동기화하려면 서버 채널에서 실행하거나 GUILD_ID를 설정해 주세요."
+                )
                 return
 
             messages: list[str] = []
-            if scope in {"global", "all"}:
-                synced = await self.clean_sync_global_application_commands()
+            if scope == "global":
+                synced = await self.clean_sync_global_application_commands(guild)
                 messages.append(f"global {len(synced)}개")
-            if scope in {"guild", "all"} and guild is not None:
+            elif scope == "guild" and guild is not None:
                 synced = await self.clean_sync_guild_application_commands(guild)
                 messages.append(f"guild({guild.id}) {len(synced)}개")
+            elif scope == "all":
+                if guild is not None:
+                    synced = await self.clean_sync_guild_application_commands(guild)
+                    messages.append(f"global 정리, guild({guild.id}) {len(synced)}개")
+                else:
+                    synced = await self.clean_sync_global_application_commands()
+                    messages.append(f"global {len(synced)}개")
 
-            await ctx.reply("Slash Command를 초기화 후 재동기화했습니다: " + ", ".join(messages))
+            await ctx.reply(
+                "Slash Command를 초기화 후 재동기화했습니다: " + ", ".join(messages)
+            )
 
         self.add_command(auth_group)
 
@@ -186,11 +222,15 @@ class Team0x34Bot(commands.Bot):
         await self.database.close()
         await super().close()
 
-    async def on_app_command_error(self, interaction: discord.Interaction, error: app_commands.AppCommandError) -> None:
+    async def on_app_command_error(
+        self, interaction: discord.Interaction, error: app_commands.AppCommandError
+    ) -> None:
         """Slash Command, Button, Select, Modal 처리 중 발생한 오류를 중앙에서 처리합니다."""
         await self.error_handler.handle_app_command_error(interaction, error)
 
-    async def on_command_error(self, ctx: commands.Context, error: commands.CommandError) -> None:
+    async def on_command_error(
+        self, ctx: commands.Context, error: commands.CommandError
+    ) -> None:
         """비상 텍스트 명령 오류를 중앙에서 처리합니다."""
         await self.error_handler.handle_command_error(ctx, error)
 
@@ -208,7 +248,9 @@ class Team0x34Bot(commands.Bot):
 
 async def main() -> None:
     """설정을 읽고 봇을 실행하는 진입점입니다."""
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    logging.basicConfig(
+        level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s"
+    )
     settings = load_settings()
 
     async with Team0x34Bot(settings) as bot:

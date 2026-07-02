@@ -130,14 +130,16 @@ Gemini 무료 티어의 분당 호출 제한에 걸리면 봇은 `ResourceExhaus
 
 ## Slash Command 초기화
 
-고스트 커맨드가 쌓이면 `.env` 또는 Railway Variables에서 아래 값을 켠 뒤 봇을 재시작하세요.
+`GUILD_ID`가 설정되어 있으면 봇은 시작 시 기존 전역 Slash Command를 먼저 비우고, 해당 서버에만 Guild 명령을 동기화합니다. 전역 명령과 Guild 명령이 같은 서버에 동시에 보이면 Discord 클라이언트에서 같은 명령이 2개로 뜨므로, 개발/테스트 배포는 한 범위만 남기도록 처리합니다. 단, 이미 올라간 전역 명령 삭제는 Discord 정책상 반영에 최대 1시간 걸릴 수 있습니다.
+
+서버 명령까지 완전히 비우고 현재 코드 기준으로 다시 올리고 싶으면 `.env` 또는 Railway Variables에서 아래 값을 켠 뒤 봇을 재시작하세요.
 
 ```env
 SYNC_COMMANDS=true
 CLEAR_COMMANDS_ON_START=true
 ```
 
-`GUILD_ID`가 설정되어 있으면 전역 명령과 해당 테스트 서버 명령을 먼저 비운 뒤 서버 명령을 빠르게 재등록합니다. `GUILD_ID`가 비어 있으면 전역 명령을 비운 뒤 전역 명령으로 재등록합니다. 전역 명령은 Discord 정책상 반영에 최대 1시간이 걸릴 수 있으므로 개발 중에는 `GUILD_ID`를 넣고 서버 단위로 테스트하는 편이 좋습니다.
+`GUILD_ID`가 설정되어 있으면 전역 명령과 해당 테스트 서버 명령을 먼저 비운 뒤 서버 명령만 빠르게 재등록합니다. `GUILD_ID`가 비어 있으면 전역 명령을 비운 뒤 전역 명령으로 재등록합니다. 개발 중에는 `GUILD_ID`를 넣고 서버 단위로 테스트하는 편이 좋습니다.
 
 슬래시 커맨드가 아예 보이지 않는 상황을 대비해 봇 소유자 전용 텍스트 명령도 선택적으로 켤 수 있습니다.
 
@@ -145,4 +147,4 @@ CLEAR_COMMANDS_ON_START=true
 ENABLE_ADMIN_TEXT_COMMANDS=true
 ```
 
-이 경우 Discord Developer Portal에서 Message Content Intent를 활성화해야 하며, 서버 채널에서 `!인증 sync guild`, `!인증 sync global`, `!인증 clear all`처럼 사용할 수 있습니다.
+이 경우 Discord Developer Portal에서 Message Content Intent를 활성화해야 하며, 서버 채널에서 `!인증 sync guild`, `!인증 sync global`, `!인증 sync all`, `!인증 clear all`처럼 사용할 수 있습니다. `sync guild`와 `sync all`은 중복 노출을 막기 위해 전역 명령을 정리한 뒤 Guild 명령만 재등록합니다.
