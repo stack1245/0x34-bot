@@ -458,7 +458,7 @@ class RecruitmentModal(discord.ui.Modal, title="팀원 모집"):
         label="대회/프로젝트 설명",
         placeholder="모집 목적, 기간, 필요한 역할 등을 적어 주세요.",
         style=discord.TextStyle.long,
-        max_length=1000,
+        max_length=4000,
     )
     max_members_input = discord.ui.TextInput(label="정원", placeholder="예: 4", default="4", max_length=3)
 
