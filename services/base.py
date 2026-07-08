@@ -4,17 +4,16 @@ import logging
 from dataclasses import dataclass
 from typing import Awaitable, Callable, Generic, TypeVar
 
-
 T = TypeVar("T")
 
 
 class ServiceError(RuntimeError):
-    """Base exception raised by service-layer operations."""
+    """서비스 계층 예외의 기준 타입입니다."""
 
 
 @dataclass(frozen=True)
 class ServiceResult(Generic[T]):
-    """Explicit success/failure envelope for service operations."""
+    """서비스 작업의 성공/실패를 명시적으로 담는 결과 타입입니다."""
 
     ok: bool
     value: T | None = None
@@ -30,7 +29,7 @@ class ServiceResult(Generic[T]):
 
 
 class BaseService:
-    """Common service base with a logger and graceful async execution helper."""
+    """서비스 공통 로거와 안전 실행 헬퍼를 제공합니다."""
 
     def __init__(self, *, logger: logging.Logger | None = None) -> None:
         self.logger = logger or logging.getLogger(self.__class__.__module__)

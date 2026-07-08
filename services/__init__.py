@@ -1,1 +1,1 @@
-"""Service layer for business logic, integrations, and runtime state."""
+"""비즈니스 로직, 외부 연동, 런타임 상태를 담는 서비스 계층입니다."""

@@ -9,7 +9,7 @@ import google.generativeai as genai
 
 @dataclass(frozen=True)
 class AIRequest:
-    """Provider-neutral AI generation request."""
+    """AI 제공자와 무관한 생성 요청입니다."""
 
     prompt: str
     system_instruction: str
@@ -19,21 +19,20 @@ class AIRequest:
 
 @dataclass(frozen=True)
 class AIResponse:
-    """Provider-neutral AI generation response."""
+    """AI 제공자와 무관한 생성 응답입니다."""
 
     text: str
     model: str
 
 
 class AIProvider(Protocol):
-    """Contract implemented by Gemini, future Gemini Pro, or other providers."""
+    """Gemini와 다른 AI 제공자가 구현하는 생성 계약입니다."""
 
-    async def generate(self, request: AIRequest) -> AIResponse:
-        ...
+    async def generate(self, request: AIRequest) -> AIResponse: ...
 
 
 class GeminiProvider:
-    """Thin Gemini adapter kept outside cogs so model changes happen in one place."""
+    """Gemini SDK 호출을 Cog 밖으로 격리하는 어댑터입니다."""
 
     def __init__(self, *, api_key: str, model_name: str) -> None:
         self.api_key = api_key
@@ -52,17 +51,21 @@ class GeminiProvider:
                 "response_mime_type": request.response_mime_type,
             },
         )
-        return AIResponse(text=str(getattr(response, "text", "") or ""), model=self.model_name)
+        return AIResponse(
+            text=str(getattr(response, "text", "") or ""), model=self.model_name
+        )
 
     async def generate(self, request: AIRequest) -> AIResponse:
         return await asyncio.to_thread(self._generate_sync, request)
 
 
 class DisabledAIProvider:
-    """Provider used when no API key is configured."""
+    """API 키가 없을 때 명확한 설정 오류를 내는 제공자입니다."""
 
     async def generate(self, request: AIRequest) -> AIResponse:
-        raise RuntimeError("GEMINI_API_KEY가 설정되어 있지 않습니다. .env 또는 Railway Variables에 추가해 주세요.")
+        raise RuntimeError(
+            "GEMINI_API_KEY가 설정되어 있지 않습니다. .env 또는 Railway Variables에 추가해 주세요."
+        )
 
 
 def build_ai_provider(*, api_key: str | None, model_name: str) -> AIProvider:

@@ -10,7 +10,7 @@ from .base import BaseService
 
 @dataclass(frozen=True)
 class DashboardState:
-    """Persisted Discord message pointer for a singleton dashboard."""
+    """단일 대시보드 메시지 위치를 저장한 상태입니다."""
 
     name: str
     board_channel_id: int | None
@@ -19,7 +19,7 @@ class DashboardState:
 
 
 class StateManager(BaseService):
-    """Repository-backed state manager for restart-safe singleton messages."""
+    """재시작 후에도 단일 메시지 위치를 복구하는 상태 관리자입니다."""
 
     def __init__(self, database: Database) -> None:
         super().__init__()
@@ -38,12 +38,22 @@ class StateManager(BaseService):
             return None
         return DashboardState(
             name=str(row["name"]),
-            board_channel_id=None if row["board_channel_id"] is None else int(row["board_channel_id"]),
-            board_message_id=None if row["board_message_id"] is None else int(row["board_message_id"]),
+            board_channel_id=(
+                None
+                if row["board_channel_id"] is None
+                else int(row["board_channel_id"])
+            ),
+            board_message_id=(
+                None
+                if row["board_message_id"] is None
+                else int(row["board_message_id"])
+            ),
             updated_at=str(row["updated_at"]),
         )
 
-    async def save_dashboard_state(self, name: str, channel_id: int, message_id: int) -> None:
+    async def save_dashboard_state(
+        self, name: str, channel_id: int, message_id: int
+    ) -> None:
         await self.database.execute(
             """
             INSERT INTO dashboard_state (name, board_channel_id, board_message_id, updated_at)
@@ -58,4 +68,6 @@ class StateManager(BaseService):
         )
 
     async def clear_dashboard_state(self, name: str) -> None:
-        await self.database.execute("DELETE FROM dashboard_state WHERE name = ?", (name,))
+        await self.database.execute(
+            "DELETE FROM dashboard_state WHERE name = ?", (name,)
+        )

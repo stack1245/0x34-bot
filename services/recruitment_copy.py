@@ -35,11 +35,7 @@ GEMINI_SYSTEM_PROMPT = """
 
 
 def build_recruitment_system_prompt() -> str:
-    """Build the system prompt used for AI-generated recruitment copy.
-
-    Returns:
-        Prompt text containing current Korean time context and response schema rules.
-    """
+    """현재 한국 시간과 모집글 JSON 규칙을 Gemini 시스템 프롬프트에 주입합니다."""
     return f"""
 {get_current_time_context()}
 위 제공된 '현재 시간'을 기준으로 날짜를 계산해라. 본문에 연도가 생략되어 있다면 무조건 현재 연도를 사용하고, 절대로 지나간 과거 연도로 작성하지 마라.
@@ -50,14 +46,7 @@ def build_recruitment_system_prompt() -> str:
 
 
 def _strip_json_code_fence(value: str) -> str:
-    """Extract JSON text from an optional Markdown code fence.
-
-    Args:
-        value: Raw model response text.
-
-    Returns:
-        Response text without a surrounding JSON code fence.
-    """
+    """Gemini 응답이 코드블록으로 감싸져 있어도 JSON 본문만 꺼냅니다."""
     text = value.strip()
     fence_match = re.search(
         r"```(?:json)?\s*(.*?)\s*```", text, flags=re.IGNORECASE | re.DOTALL
@@ -68,14 +57,7 @@ def _strip_json_code_fence(value: str) -> str:
 
 
 def _clean_title(value: str) -> str:
-    """Normalize an AI-generated recruitment title.
-
-    Args:
-        value: Raw title candidate.
-
-    Returns:
-        Trimmed title without Markdown heading or title prefixes.
-    """
+    """AI가 붙일 수 있는 제목 마크다운과 접두어를 정리합니다."""
     title = value.strip()
     title = re.sub(r"^#+\s*", "", title)
     title = re.sub(
@@ -85,14 +67,7 @@ def _clean_title(value: str) -> str:
 
 
 def _parse_max_members(value: object) -> int:
-    """Parse the AI-provided max member value into a safe capacity integer.
-
-    Args:
-        value: JSON value returned by the AI provider.
-
-    Returns:
-        Non-negative capacity, falling back to the default capacity on invalid input.
-    """
+    """AI가 반환한 정원 값을 음수가 아닌 정수로 보정합니다."""
     try:
         if isinstance(value, bool):
             raise ValueError("bool is not a valid max_members")
@@ -118,15 +93,7 @@ def _parse_max_members(value: object) -> int:
 def parse_gemini_recruitment(
     raw_text: str, fallback_source: str
 ) -> tuple[str, str, int]:
-    """Convert a Gemini recruitment response into embed-ready fields.
-
-    Args:
-        raw_text: Raw Gemini response body.
-        fallback_source: Source text used when the response omits title or description.
-
-    Returns:
-        Tuple of title, description, and max member capacity.
-    """
+    """Gemini 응답을 모집 Embed에 필요한 제목, 설명, 정원으로 변환합니다."""
     cleaned = _strip_json_code_fence(raw_text)
     title = ""
     description = ""
@@ -163,12 +130,7 @@ def parse_gemini_recruitment(
 
 
 class RecruitmentCopyService:
-    """Application service for AI-assisted recruitment copy generation.
-
-    Args:
-        ai_provider: Provider-neutral AI generation interface.
-        logger: Optional logger used by URL scraping and diagnostics.
-    """
+    """AI 모집글 생성과 입력 전처리를 담당합니다."""
 
     def __init__(
         self, ai_provider: AIProvider, *, logger: logging.Logger | None = None
@@ -177,14 +139,6 @@ class RecruitmentCopyService:
         self.logger = logger or logging.getLogger(__name__)
 
     async def generate_copy_text(self, source_text: str) -> str:
-        """Generate raw recruitment JSON text through the configured AI provider.
-
-        Args:
-            source_text: User-provided and scraped source material.
-
-        Returns:
-            Raw model response text.
-        """
         response = await self.ai_provider.generate(
             AIRequest(
                 system_instruction=build_recruitment_system_prompt(),
@@ -201,26 +155,10 @@ class RecruitmentCopyService:
         return response.text
 
     async def generate_copy(self, source_text: str) -> tuple[str, str, int]:
-        """Generate and parse recruitment copy for a Discord embed.
-
-        Args:
-            source_text: User-provided and scraped source material.
-
-        Returns:
-            Tuple of title, description, and max member capacity.
-        """
         raw_text = await self.generate_copy_text(source_text)
         return parse_gemini_recruitment(raw_text, source_text)
 
     async def prepare_source_text(self, target_info: str) -> str:
-        """Prepare conversational recruitment input and scraped URL text for AI generation.
-
-        Args:
-            target_info: User-provided link or free-form recruitment source text.
-
-        Returns:
-            Normalized source text capped to the AI prompt limit.
-        """
         return await prepare_conversational_source_text(
             target_info,
             max_length=MAX_RECRUITMENT_SOURCE_TEXT_LENGTH,

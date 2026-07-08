@@ -17,11 +17,7 @@ from utils.database import Database
 
 @runtime_checkable
 class RecruitmentRepositoryProtocol(Protocol):
-    """Persistence contract for recruitment aggregates.
-
-    Implementations must isolate SQL and transaction details from domain services while preserving
-    the owner participant invariant.
-    """
+    """모집 도메인이 의존하는 저장소 계약입니다."""
 
     async def create_with_owner(
         self,
@@ -30,46 +26,13 @@ class RecruitmentRepositoryProtocol(Protocol):
         status: RecruitmentStatus,
         owner_status: ParticipantStatus,
         timestamp: str,
-    ) -> int:
-        """Persist a recruitment and its owner participant atomically.
+    ) -> int: ...
 
-        Args:
-            request: Creation payload supplied by the domain service.
-            status: Initial recruitment status.
-            owner_status: Participant status assigned to the recruitment author.
-            timestamp: UTC ISO timestamp reused for recruitment and owner rows.
-
-        Returns:
-            Newly created recruitment primary key.
-        """
-        ...
-
-    async def update_thread_id(self, recruitment_id: int, thread_id: int) -> None:
-        """Persist the Discord private workspace thread ID for a recruitment.
-
-        Args:
-            recruitment_id: Recruitment primary key.
-            thread_id: Discord thread snowflake.
-
-        Returns:
-            None.
-        """
-        ...
+    async def update_thread_id(self, recruitment_id: int, thread_id: int) -> None: ...
 
     async def set_status(
         self, recruitment_id: int, status: RecruitmentStatus, closed_at: str | None
-    ) -> None:
-        """Persist the lifecycle status and close timestamp for a recruitment.
-
-        Args:
-            recruitment_id: Recruitment primary key.
-            status: Target lifecycle status.
-            closed_at: UTC ISO close timestamp, or None when reopening.
-
-        Returns:
-            None.
-        """
-        ...
+    ) -> None: ...
 
     async def update_details(
         self,
@@ -79,55 +42,15 @@ class RecruitmentRepositoryProtocol(Protocol):
         title: str,
         target: str,
         max_members: int,
-    ) -> None:
-        """Persist editable recruitment fields scoped to a guild.
+    ) -> None: ...
 
-        Args:
-            recruitment_id: Recruitment primary key.
-            guild_id: Discord guild snowflake used as a safety boundary.
-            title: Updated public title.
-            target: Updated public body.
-            max_members: Updated maximum confirmed participant count.
+    async def fetch_by_message_id(self, message_id: int) -> RecruitmentRow | None: ...
 
-        Returns:
-            None.
-        """
-        ...
-
-    async def fetch_by_message_id(self, message_id: int) -> RecruitmentRow | None:
-        """Fetch a recruitment row by Discord message ID.
-
-        Args:
-            message_id: Discord message snowflake.
-
-        Returns:
-            Recruitment row when found; otherwise None.
-        """
-        ...
-
-    async def fetch_by_id(self, recruitment_id: int) -> RecruitmentRow | None:
-        """Fetch a recruitment row by primary key.
-
-        Args:
-            recruitment_id: Recruitment primary key.
-
-        Returns:
-            Recruitment row when found; otherwise None.
-        """
-        ...
+    async def fetch_by_id(self, recruitment_id: int) -> RecruitmentRow | None: ...
 
     async def fetch_author_context(
         self, recruitment_id: int
-    ) -> RecruitmentAuthorContext | None:
-        """Fetch owner metadata required for participant invariant enforcement.
-
-        Args:
-            recruitment_id: Recruitment primary key.
-
-        Returns:
-            Author context when the recruitment exists; otherwise None.
-        """
-        ...
+    ) -> RecruitmentAuthorContext | None: ...
 
     async def upsert_participant_status(
         self,
@@ -138,89 +61,30 @@ class RecruitmentRepositoryProtocol(Protocol):
         application_reason: str | None,
         rejection_reason: str | None,
         updated_at: str,
-    ) -> None:
-        """Insert or update a participant status projection.
-
-        Args:
-            recruitment_id: Recruitment primary key.
-            user_id: Discord user snowflake.
-            status: Target participant status.
-            application_reason: Optional applicant-provided reason to persist.
-            rejection_reason: Optional owner/system rejection reason to persist.
-            updated_at: UTC ISO mutation timestamp.
-
-        Returns:
-            None.
-        """
-        ...
+    ) -> None: ...
 
     async def ensure_owner_participant(
         self, recruitment_id: int, author_id: int, updated_at: str
-    ) -> None:
-        """Upsert the owner participant row for an existing recruitment.
-
-        Args:
-            recruitment_id: Recruitment primary key.
-            author_id: Discord user snowflake of the recruitment owner.
-            updated_at: UTC ISO timestamp used for the owner participant row.
-
-        Returns:
-            None.
-        """
-        ...
+    ) -> None: ...
 
     async def fetch_participants(
         self, recruitment_id: int
-    ) -> list[RecruitmentParticipant]:
-        """Fetch ordered participants for a recruitment.
-
-        Args:
-            recruitment_id: Recruitment primary key.
-
-        Returns:
-            Ordered participant projections.
-        """
-        ...
+    ) -> list[RecruitmentParticipant]: ...
 
     async def fetch_confirmed_participants(
         self,
         recruitment_id: int,
         owner_status: ParticipantStatus,
         accepted_status: ParticipantStatus,
-    ) -> list[RecruitmentParticipant]:
-        """Fetch owner and accepted participants in display order.
-
-        Args:
-            recruitment_id: Recruitment primary key.
-            owner_status: Owner participant status literal.
-            accepted_status: Accepted participant status literal.
-
-        Returns:
-            Ordered confirmed participant projections.
-        """
-        ...
+    ) -> list[RecruitmentParticipant]: ...
 
     async def count_participants_by_status(
         self, recruitment_id: int, status: ParticipantStatus
-    ) -> int:
-        """Count participants in a specific lifecycle state.
-
-        Args:
-            recruitment_id: Recruitment primary key.
-            status: Participant status to count.
-
-        Returns:
-            Number of matching participants.
-        """
-        ...
+    ) -> int: ...
 
 
 class SQLiteRecruitmentRepository:
-    """SQLite-backed recruitment repository.
-
-    Args:
-        database: Shared async SQLite database wrapper.
-    """
+    """SQLite로 모집 데이터를 저장하고 행 변환을 담당합니다."""
 
     def __init__(self, database: Database) -> None:
         self.database = database
@@ -233,17 +97,6 @@ class SQLiteRecruitmentRepository:
         owner_status: ParticipantStatus,
         timestamp: str,
     ) -> int:
-        """Persist a recruitment and its owner participant atomically.
-
-        Args:
-            request: Creation payload supplied by the domain service.
-            status: Initial recruitment status.
-            owner_status: Participant status assigned to the recruitment author.
-            timestamp: UTC ISO timestamp reused for recruitment and owner rows.
-
-        Returns:
-            Newly created recruitment primary key.
-        """
         async with self.database.transaction() as connection:
             cursor = await connection.execute(
                 """
@@ -270,15 +123,6 @@ class SQLiteRecruitmentRepository:
         return recruitment_id
 
     async def update_thread_id(self, recruitment_id: int, thread_id: int) -> None:
-        """Persist the Discord private workspace thread ID for a recruitment.
-
-        Args:
-            recruitment_id: Recruitment primary key.
-            thread_id: Discord thread snowflake.
-
-        Returns:
-            None.
-        """
         await self.database.execute(
             "UPDATE recruitments SET thread_id = ? WHERE id = ?",
             (thread_id, recruitment_id),
@@ -287,16 +131,6 @@ class SQLiteRecruitmentRepository:
     async def set_status(
         self, recruitment_id: int, status: RecruitmentStatus, closed_at: str | None
     ) -> None:
-        """Persist the lifecycle status and close timestamp for a recruitment.
-
-        Args:
-            recruitment_id: Recruitment primary key.
-            status: Target lifecycle status.
-            closed_at: UTC ISO close timestamp, or None when reopening.
-
-        Returns:
-            None.
-        """
         await self.database.execute(
             "UPDATE recruitments SET status = ?, closed_at = ? WHERE id = ?",
             (status, closed_at, recruitment_id),
@@ -311,18 +145,6 @@ class SQLiteRecruitmentRepository:
         target: str,
         max_members: int,
     ) -> None:
-        """Persist editable recruitment fields scoped to a guild.
-
-        Args:
-            recruitment_id: Recruitment primary key.
-            guild_id: Discord guild snowflake used as a safety boundary.
-            title: Updated public title.
-            target: Updated public body.
-            max_members: Updated maximum confirmed participant count.
-
-        Returns:
-            None.
-        """
         await self.database.execute(
             """
             UPDATE recruitments
@@ -333,14 +155,6 @@ class SQLiteRecruitmentRepository:
         )
 
     async def fetch_by_message_id(self, message_id: int) -> RecruitmentRow | None:
-        """Fetch a recruitment row by Discord message ID.
-
-        Args:
-            message_id: Discord message snowflake.
-
-        Returns:
-            Recruitment row when found; otherwise None.
-        """
         row = await self.database.fetch_one(
             "SELECT * FROM recruitments WHERE message_id = ?",
             (message_id,),
@@ -348,14 +162,6 @@ class SQLiteRecruitmentRepository:
         return self._recruitment_from_row(row)
 
     async def fetch_by_id(self, recruitment_id: int) -> RecruitmentRow | None:
-        """Fetch a recruitment row by primary key.
-
-        Args:
-            recruitment_id: Recruitment primary key.
-
-        Returns:
-            Recruitment row when found; otherwise None.
-        """
         row = await self.database.fetch_one(
             "SELECT * FROM recruitments WHERE id = ?",
             (recruitment_id,),
@@ -365,14 +171,6 @@ class SQLiteRecruitmentRepository:
     async def fetch_author_context(
         self, recruitment_id: int
     ) -> RecruitmentAuthorContext | None:
-        """Fetch owner metadata required for participant invariant enforcement.
-
-        Args:
-            recruitment_id: Recruitment primary key.
-
-        Returns:
-            Author context when the recruitment exists; otherwise None.
-        """
         row = await self.database.fetch_one(
             "SELECT author_id, created_at FROM recruitments WHERE id = ?",
             (recruitment_id,),
@@ -394,19 +192,6 @@ class SQLiteRecruitmentRepository:
         rejection_reason: str | None,
         updated_at: str,
     ) -> None:
-        """Insert or update a participant status projection.
-
-        Args:
-            recruitment_id: Recruitment primary key.
-            user_id: Discord user snowflake.
-            status: Target participant status.
-            application_reason: Optional applicant-provided reason to persist.
-            rejection_reason: Optional owner/system rejection reason to persist.
-            updated_at: UTC ISO mutation timestamp.
-
-        Returns:
-            None.
-        """
         await self.database.execute(
             """
             INSERT INTO recruitment_participants (recruitment_id, user_id, status, application_reason, rejection_reason, updated_at)
@@ -431,16 +216,6 @@ class SQLiteRecruitmentRepository:
     async def ensure_owner_participant(
         self, recruitment_id: int, author_id: int, updated_at: str
     ) -> None:
-        """Upsert the owner participant row for an existing recruitment.
-
-        Args:
-            recruitment_id: Recruitment primary key.
-            author_id: Discord user snowflake of the recruitment owner.
-            updated_at: UTC ISO timestamp used for the owner participant row.
-
-        Returns:
-            None.
-        """
         connection = self.database._require_connection()
         await self._upsert_owner_participant(
             connection, recruitment_id, author_id, "owner", updated_at
@@ -450,14 +225,6 @@ class SQLiteRecruitmentRepository:
     async def fetch_participants(
         self, recruitment_id: int
     ) -> list[RecruitmentParticipant]:
-        """Fetch ordered participants for a recruitment.
-
-        Args:
-            recruitment_id: Recruitment primary key.
-
-        Returns:
-            Ordered participant projections.
-        """
         rows = await self.database.fetch_all(
             """
             SELECT user_id, status, application_reason, rejection_reason, updated_at
@@ -484,16 +251,6 @@ class SQLiteRecruitmentRepository:
         owner_status: ParticipantStatus,
         accepted_status: ParticipantStatus,
     ) -> list[RecruitmentParticipant]:
-        """Fetch owner and accepted participants in display order.
-
-        Args:
-            recruitment_id: Recruitment primary key.
-            owner_status: Owner participant status literal.
-            accepted_status: Accepted participant status literal.
-
-        Returns:
-            Ordered confirmed participant projections.
-        """
         rows = await self.database.fetch_all(
             """
             SELECT user_id, status, application_reason, rejection_reason, updated_at
@@ -515,15 +272,6 @@ class SQLiteRecruitmentRepository:
     async def count_participants_by_status(
         self, recruitment_id: int, status: ParticipantStatus
     ) -> int:
-        """Count participants in a specific lifecycle state.
-
-        Args:
-            recruitment_id: Recruitment primary key.
-            status: Participant status to count.
-
-        Returns:
-            Number of matching participants.
-        """
         row = await self.database.fetch_one(
             """
             SELECT COUNT(*) AS participant_count
@@ -544,18 +292,6 @@ class SQLiteRecruitmentRepository:
         owner_status: ParticipantStatus,
         updated_at: str,
     ) -> None:
-        """Upsert owner participant using an existing SQLite connection.
-
-        Args:
-            connection: Active SQLite connection or transaction.
-            recruitment_id: Recruitment primary key.
-            author_id: Discord user snowflake of the recruitment owner.
-            owner_status: Owner participant status literal.
-            updated_at: UTC ISO timestamp used for ordering.
-
-        Returns:
-            None.
-        """
         await connection.execute(
             """
             INSERT INTO recruitment_participants (recruitment_id, user_id, status, application_reason, rejection_reason, updated_at)
@@ -569,14 +305,6 @@ class SQLiteRecruitmentRepository:
         )
 
     def _recruitment_from_row(self, row: aiosqlite.Row | None) -> RecruitmentRow | None:
-        """Convert a SQLite recruitment row into a typed projection.
-
-        Args:
-            row: SQLite row returned by a recruitment SELECT query.
-
-        Returns:
-            Typed recruitment row when present; otherwise None.
-        """
         if row is None:
             return None
         return {
@@ -595,14 +323,6 @@ class SQLiteRecruitmentRepository:
         }
 
     def _participant_from_row(self, row: aiosqlite.Row) -> RecruitmentParticipant:
-        """Convert a SQLite participant row into a typed projection.
-
-        Args:
-            row: SQLite row returned by a participant SELECT query.
-
-        Returns:
-            Typed participant projection.
-        """
         return {
             "user_id": int(row["user_id"]),
             "status": cast(ParticipantStatus, str(row["status"])),

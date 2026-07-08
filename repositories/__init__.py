@@ -1,4 +1,4 @@
-"""Repository layer for database access contracts and implementations."""
+"""DB 접근 계약과 구현체를 담는 저장소 계층입니다."""
 
 from repositories.recruitment import (
     RecruitmentRepositoryProtocol,

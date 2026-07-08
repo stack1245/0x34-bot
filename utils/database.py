@@ -6,7 +6,6 @@ from typing import Any, AsyncIterator, Iterable
 
 import aiosqlite
 
-
 SCHEMA: tuple[str, ...] = (
     """
     CREATE TABLE IF NOT EXISTS schedules (
@@ -117,27 +116,41 @@ class Database:
         cursor = await connection.execute("PRAGMA table_info(schedules)")
         schedule_columns = {row[1] for row in await cursor.fetchall()}
         if "is_confirmed" not in schedule_columns:
-            await connection.execute("ALTER TABLE schedules ADD COLUMN is_confirmed INTEGER NOT NULL DEFAULT 0")
+            await connection.execute(
+                "ALTER TABLE schedules ADD COLUMN is_confirmed INTEGER NOT NULL DEFAULT 0"
+            )
         if "is_deleted" not in schedule_columns:
-            await connection.execute("ALTER TABLE schedules ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0")
+            await connection.execute(
+                "ALTER TABLE schedules ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0"
+            )
         if "deleted_at" not in schedule_columns:
             await connection.execute("ALTER TABLE schedules ADD COLUMN deleted_at TEXT")
 
         cursor = await connection.execute("PRAGMA table_info(recruitments)")
         columns = {row[1] for row in await cursor.fetchall()}
         if "thread_id" not in columns:
-            await connection.execute("ALTER TABLE recruitments ADD COLUMN thread_id INTEGER")
+            await connection.execute(
+                "ALTER TABLE recruitments ADD COLUMN thread_id INTEGER"
+            )
 
         cursor = await connection.execute("PRAGMA table_info(recruitment_participants)")
         participant_columns = {row[1] for row in await cursor.fetchall()}
         if "status" not in participant_columns:
-            await connection.execute("ALTER TABLE recruitment_participants ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'")
+            await connection.execute(
+                "ALTER TABLE recruitment_participants ADD COLUMN status TEXT NOT NULL DEFAULT 'pending'"
+            )
         if "application_reason" not in participant_columns:
-            await connection.execute("ALTER TABLE recruitment_participants ADD COLUMN application_reason TEXT")
+            await connection.execute(
+                "ALTER TABLE recruitment_participants ADD COLUMN application_reason TEXT"
+            )
         if "rejection_reason" not in participant_columns:
-            await connection.execute("ALTER TABLE recruitment_participants ADD COLUMN rejection_reason TEXT")
+            await connection.execute(
+                "ALTER TABLE recruitment_participants ADD COLUMN rejection_reason TEXT"
+            )
         if "updated_at" not in participant_columns:
-            await connection.execute("ALTER TABLE recruitment_participants ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''")
+            await connection.execute(
+                "ALTER TABLE recruitment_participants ADD COLUMN updated_at TEXT NOT NULL DEFAULT ''"
+            )
 
         await connection.execute(
             """
@@ -183,7 +196,7 @@ class Database:
 
     @asynccontextmanager
     async def transaction(self) -> AsyncIterator[aiosqlite.Connection]:
-        """Run multiple low-level statements in one async SQLite transaction."""
+        """여러 저수준 SQL 문장을 하나의 비동기 SQLite 트랜잭션으로 실행합니다."""
         connection = self._require_connection()
         try:
             await connection.execute("BEGIN")
@@ -194,13 +207,17 @@ class Database:
         else:
             await connection.commit()
 
-    async def fetch_one(self, query: str, params: Iterable[Any] = ()) -> aiosqlite.Row | None:
+    async def fetch_one(
+        self, query: str, params: Iterable[Any] = ()
+    ) -> aiosqlite.Row | None:
         """하나의 행만 필요한 SELECT 쿼리에 사용합니다."""
         connection = self._require_connection()
         cursor = await connection.execute(query, tuple(params))
         return await cursor.fetchone()
 
-    async def fetch_all(self, query: str, params: Iterable[Any] = ()) -> list[aiosqlite.Row]:
+    async def fetch_all(
+        self, query: str, params: Iterable[Any] = ()
+    ) -> list[aiosqlite.Row]:
         """여러 행이 필요한 SELECT 쿼리에 사용합니다."""
         connection = self._require_connection()
         cursor = await connection.execute(query, tuple(params))

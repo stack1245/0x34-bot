@@ -1444,7 +1444,7 @@ class RecruitmentCog(commands.Cog):
         return None
 
     async def build_recruitment_embed(self, message_id: int) -> discord.Embed:
-        """Backward-compatible wrapper for older call sites."""
+        """기존 호출부 호환을 위한 래퍼입니다."""
         return await self.update_recruitment_embed(message_id)
 
     async def update_recruitment_embed(self, message_id: int) -> discord.Embed:
