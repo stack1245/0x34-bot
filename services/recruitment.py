@@ -9,7 +9,6 @@ from services.base import BaseService, ServiceError
 from utils.database import Database
 from utils.datetime import now_utc_iso
 
-
 STATUS_OPEN = "open"
 STATUS_CLOSED = "closed"
 PARTICIPANT_PENDING = "pending"
@@ -60,7 +59,9 @@ class RecruitmentService(BaseService):
                 ),
             )
             recruitment_id = int(cursor.lastrowid)
-            await self._upsert_owner_participant(connection, recruitment_id, request.author_id, timestamp)
+            await self._upsert_owner_participant(
+                connection, recruitment_id, request.author_id, timestamp
+            )
         return recruitment_id
 
     async def update_thread_id(self, recruitment_id: int, thread_id: int) -> None:
@@ -73,6 +74,12 @@ class RecruitmentService(BaseService):
         await self.database.execute(
             "UPDATE recruitments SET status = ?, closed_at = ? WHERE id = ?",
             (STATUS_CLOSED, now_utc_iso(), recruitment_id),
+        )
+
+    async def reopen_recruitment(self, recruitment_id: int) -> None:
+        await self.database.execute(
+            "UPDATE recruitments SET status = ?, closed_at = NULL WHERE id = ?",
+            (STATUS_OPEN, recruitment_id),
         )
 
     async def update_recruitment_details(
@@ -93,7 +100,9 @@ class RecruitmentService(BaseService):
             (title, target, max_members, recruitment_id, guild_id),
         )
 
-    async def get_recruitment_by_message_id(self, message_id: int) -> dict[str, Any] | None:
+    async def get_recruitment_by_message_id(
+        self, message_id: int
+    ) -> dict[str, Any] | None:
         row = await self.database.fetch_one(
             "SELECT * FROM recruitments WHERE message_id = ?",
             (message_id,),
@@ -107,7 +116,9 @@ class RecruitmentService(BaseService):
         )
         return await self._hydrate_recruitment(row)
 
-    async def get_participant(self, recruitment_id: int, user_id: int) -> dict[str, Any] | None:
+    async def get_participant(
+        self, recruitment_id: int, user_id: int
+    ) -> dict[str, Any] | None:
         recruitment = await self.get_recruitment_by_id(recruitment_id)
         if recruitment is None:
             return None
@@ -150,20 +161,35 @@ class RecruitmentService(BaseService):
                 rejection_reason = COALESCE(excluded.rejection_reason, recruitment_participants.rejection_reason),
                 updated_at = excluded.updated_at
             """,
-            (recruitment_id, user_id, effective_status, application_reason, rejection_reason, now_utc_iso()),
+            (
+                recruitment_id,
+                user_id,
+                effective_status,
+                application_reason,
+                rejection_reason,
+                now_utc_iso(),
+            ),
         )
 
     async def is_owner(self, recruitment_id: int, user_id: int) -> bool:
         participant = await self.get_participant(recruitment_id, user_id)
         return participant is not None and participant["status"] == PARTICIPANT_OWNER
 
-    async def get_participant_user_ids(self, recruitment_id: int, status: str) -> list[int]:
+    async def get_participant_user_ids(
+        self, recruitment_id: int, status: str
+    ) -> list[int]:
         recruitment = await self.get_recruitment_by_id(recruitment_id)
         if recruitment is None:
             return []
-        return [int(row["user_id"]) for row in recruitment["participants"] if row["status"] == status]
+        return [
+            int(row["user_id"])
+            for row in recruitment["participants"]
+            if row["status"] == status
+        ]
 
-    async def get_confirmed_participants(self, recruitment_id: int) -> list[dict[str, Any]]:
+    async def get_confirmed_participants(
+        self, recruitment_id: int
+    ) -> list[dict[str, Any]]:
         recruitment = await self.database.fetch_one(
             "SELECT author_id, created_at FROM recruitments WHERE id = ?",
             (recruitment_id,),
@@ -194,8 +220,13 @@ class RecruitmentService(BaseService):
         )
         return [dict(row) for row in rows]
 
-    async def get_confirmed_participant_user_ids(self, recruitment_id: int) -> list[int]:
-        return [int(row["user_id"]) for row in await self.get_confirmed_participants(recruitment_id)]
+    async def get_confirmed_participant_user_ids(
+        self, recruitment_id: int
+    ) -> list[int]:
+        return [
+            int(row["user_id"])
+            for row in await self.get_confirmed_participants(recruitment_id)
+        ]
 
     async def get_pending_participant_count(self, recruitment_id: int) -> int:
         row = await self.database.fetch_one(
@@ -210,14 +241,22 @@ class RecruitmentService(BaseService):
             return 0
         return int(row["pending_count"])
 
-    async def get_pending_participants(self, recruitment_id: int) -> list[dict[str, Any]]:
+    async def get_pending_participants(
+        self, recruitment_id: int
+    ) -> list[dict[str, Any]]:
         recruitment = await self.get_recruitment_by_id(recruitment_id)
         if recruitment is None:
             return []
-        pending_rows = [row for row in recruitment["participants"] if row["status"] == PARTICIPANT_PENDING]
+        pending_rows = [
+            row
+            for row in recruitment["participants"]
+            if row["status"] == PARTICIPANT_PENDING
+        ]
         return pending_rows[:25]
 
-    async def _hydrate_recruitment(self, row: aiosqlite.Row | None) -> dict[str, Any] | None:
+    async def _hydrate_recruitment(
+        self, row: aiosqlite.Row | None
+    ) -> dict[str, Any] | None:
         if row is None:
             return None
 
@@ -227,12 +266,18 @@ class RecruitmentService(BaseService):
             int(recruitment["author_id"]),
             str(recruitment["created_at"]),
         )
-        recruitment["participants"] = await self._fetch_participants(int(recruitment["id"]))
+        recruitment["participants"] = await self._fetch_participants(
+            int(recruitment["id"])
+        )
         return recruitment
 
-    async def ensure_owner_participant(self, recruitment_id: int, author_id: int, updated_at: str | None = None) -> None:
+    async def ensure_owner_participant(
+        self, recruitment_id: int, author_id: int, updated_at: str | None = None
+    ) -> None:
         connection = self.database._require_connection()
-        await self._upsert_owner_participant(connection, recruitment_id, author_id, updated_at or now_utc_iso())
+        await self._upsert_owner_participant(
+            connection, recruitment_id, author_id, updated_at or now_utc_iso()
+        )
         await connection.commit()
 
     async def _upsert_owner_participant(
