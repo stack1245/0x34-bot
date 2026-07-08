@@ -24,10 +24,13 @@ Team 0x34 운영을 위한 `discord.py` 기반 Discord 봇입니다. Slash Comma
 │   ├── base.py
 │   ├── error_handler.py
 │   ├── recruitment.py
+│   ├── recruitment_copy.py
+│   ├── recruitment_models.py
 │   └── state_manager.py
 ├── repositories/
 │   ├── __init__.py
-│   └── base.py
+│   ├── base.py
+│   └── recruitment.py
 └── utils/
     ├── __init__.py
     ├── ai_input.py
@@ -71,9 +74,12 @@ flowchart TD
 
 - `services.base.BaseService`: 서비스 레이어 공통 로깅과 `run_safely()` 실패 격리
 - `services.state_manager.StateManager`: `dashboard_state`를 재시작 후에도 복구하는 단일 메시지 상태 관리자
-- `services.recruitment.RecruitmentService`: 모집 생성과 작성자 owner 참가자 등록을 하나의 트랜잭션으로 묶고, 모집 조회 시 owner가 포함된 참가자 목록을 보장하는 도메인 서비스
+- `services.recruitment.RecruitmentService`: Repository Protocol에 의존하는 모집 도메인 서비스입니다. 모집 생성, 마감/마감 취소, owner invariant, 참가자 상태 전환을 담당하며 SQL 구현에는 직접 의존하지 않습니다.
+- `services.recruitment_models`: 모집 상태, 참가자 상태, 생성 명령, hydrated recruitment aggregate를 TypedDict/dataclass 계약으로 정의합니다.
+- `services.recruitment_copy.RecruitmentCopyService`: Gemini 프롬프트 구성, URL/대화형 입력 준비, AI 응답 파싱을 Cog 밖에서 담당합니다.
 - `services.ai.AIProvider`: Gemini Flash/Pro 또는 다른 모델로 교체 가능한 AI 호출 인터페이스
 - `repositories.base.Repository`: `execute/fetch_one/fetch_all` 기반 비동기 저장소 계약
+- `repositories.recruitment.SQLiteRecruitmentRepository`: SQLite SQL, row mapping, recruitment transaction을 격리하는 모집 저장소 구현체
 - `services.error_handler.BotErrorHandler`: Slash Command, 텍스트 명령, 이벤트 예외를 중앙 처리하는 graceful degradation 계층
 
 SQLite는 `PRAGMA busy_timeout=5000`, `PRAGMA journal_mode=WAL`을 사용하며, 여러 SQL을 하나의 원자적 작업으로 묶어야 할 때는 `Database.transaction()`을 사용합니다. 일정 정리는 `is_deleted` 기반 soft delete를 기본으로 하며, 일반 조회는 `WHERE is_deleted = 0` 조건을 포함해야 합니다.
