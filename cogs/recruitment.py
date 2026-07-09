@@ -32,10 +32,35 @@ from utils.embeds import STOP_COLOR, SUCCESS_COLOR, WARNING_COLOR, base_embed
 class RecruitmentView(discord.ui.View):
     """모집 메시지 아래에 붙는 Persistent Button View입니다."""
 
-    def __init__(self, cog: "RecruitmentCog") -> None:
+    APPLY_BUTTON_ID = "0x34:recruitment:apply"
+    MANAGE_BUTTON_ID = "0x34:recruitment:manage"
+    STATUS_TOGGLE_BUTTON_ID = "0x34:recruitment:close"
+
+    def __init__(self, cog: "RecruitmentCog", recruitment=None) -> None:
         # timeout=None과 고정 custom_id를 쓰면 봇 재시작 후에도 버튼 이벤트를 받을 수 있습니다.
         super().__init__(timeout=None)
         self.cog = cog
+        status = recruitment["status"] if recruitment is not None else STATUS_OPEN
+        self.configure_status_controls(str(status))
+
+    def configure_status_controls(self, status: str) -> None:
+        """현재 모집 상태에 맞춰 신청/마감 토글 버튼을 렌더링합니다."""
+        is_closed = status == STATUS_CLOSED
+        for child in self.children:
+            if not isinstance(child, discord.ui.Button):
+                continue
+            if child.custom_id == self.APPLY_BUTTON_ID:
+                child.disabled = is_closed
+            elif child.custom_id == self.STATUS_TOGGLE_BUTTON_ID:
+                child.disabled = False
+                if is_closed:
+                    child.label = "마감 취소"
+                    child.style = discord.ButtonStyle.success
+                else:
+                    child.label = "모집 마감"
+                    child.style = discord.ButtonStyle.danger
+            elif child.custom_id == self.MANAGE_BUTTON_ID:
+                child.disabled = False
 
     def disable_buttons(self) -> None:
         """현재 모집 메시지의 버튼을 모두 비활성화합니다."""
@@ -44,13 +69,8 @@ class RecruitmentView(discord.ui.View):
                 child.disabled = True
 
     def disable_for_closed_recruitment(self) -> None:
-        """마감된 모집에서는 신청과 마감만 막고 관리는 유지합니다."""
-        for child in self.children:
-            if (
-                isinstance(child, discord.ui.Button)
-                and child.custom_id != "0x34:recruitment:manage"
-            ):
-                child.disabled = True
+        """마감된 모집에서는 신청을 막고 마감 토글은 다시 열기로 바꿉니다."""
+        self.configure_status_controls(STATUS_CLOSED)
 
     async def get_recruitment_from_message(self, interaction: discord.Interaction):
         """버튼이 눌린 모집 메시지에서 모집 레코드를 찾습니다."""
@@ -172,7 +192,6 @@ class RecruitmentView(discord.ui.View):
             int(recruitment["message_id"]),
             accepted_participants,
             interaction.guild,
-            str(recruitment["status"]),
         )
         overflow_text = (
             "\n승인 참가자가 25명을 넘어서 목록에는 25명만 표시합니다."
@@ -184,58 +203,53 @@ class RecruitmentView(discord.ui.View):
             if accepted_participants
             else "제거할 승인 참가자가 없습니다."
         )
-        reopen_text = (
-            "\n마감된 모집은 [마감 취소] 버튼으로 다시 열 수 있습니다."
-            if is_closed
-            else ""
-        )
         await interaction.response.send_message(
-            f"{thread_text}\n{remove_text}{overflow_text}{reopen_text}",
+            f"{thread_text}\n{remove_text}{overflow_text}",
             view=view,
             ephemeral=True,
         )
 
     @discord.ui.button(
         label="모집 마감",
-        style=discord.ButtonStyle.primary,
+        style=discord.ButtonStyle.danger,
         custom_id="0x34:recruitment:close",
     )
-    async def close_recruitment(
+    async def toggle_status_callback(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ) -> None:
-        """작성자가 모집을 마감하고 원본 모집 메시지를 닫힌 상태로 갱신합니다."""
-        if interaction.message is None:
-            await interaction.response.send_message(
-                "모집 메시지를 찾을 수 없습니다.", ephemeral=True
-            )
-            return
-
-        recruitment = await self.cog.get_recruitment(interaction.message.id)
+        """작성자가 모집 마감/마감 취소를 한 버튼에서 토글합니다."""
+        recruitment = await self.get_recruitment_from_message(interaction)
         if recruitment is None:
-            await interaction.response.send_message(
-                "DB에서 모집 정보를 찾을 수 없습니다.", ephemeral=True
-            )
             return
         if not await self.cog.is_recruitment_owner(
             recruitment["id"], interaction.user.id
         ):
             await interaction.response.send_message(
-                "모집 소유자만 마감할 수 있습니다.", ephemeral=True
-            )
-            return
-        if recruitment["status"] == STATUS_CLOSED:
-            await interaction.response.send_message(
-                "이미 마감된 모집입니다.", ephemeral=True
+                "모집 소유자만 마감 상태를 변경할 수 있습니다.", ephemeral=True
             )
             return
 
-        await self.cog.recruitment_service.close_recruitment(int(recruitment["id"]))
+        was_closed = recruitment["status"] == STATUS_CLOSED
+        next_status = STATUS_OPEN if was_closed else STATUS_CLOSED
+        if was_closed:
+            await self.cog.recruitment_service.reopen_recruitment(
+                int(recruitment["id"])
+            )
+        else:
+            await self.cog.recruitment_service.close_recruitment(int(recruitment["id"]))
 
         updated_embed = await self.cog.build_recruitment_embed(
             recruitment["message_id"]
         )
-        self.disable_for_closed_recruitment()
+        self.configure_status_controls(next_status)
         await interaction.response.edit_message(embed=updated_embed, view=self)
+
+        if was_closed:
+            await interaction.followup.send(
+                "✅ 모집 마감을 취소했습니다. 신청하기 버튼이 다시 활성화되었습니다.",
+                ephemeral=True,
+            )
+            return
 
         thread, thread_notice = await self.cog.ensure_private_workspace_thread(
             recruitment, interaction, interaction.message
@@ -632,57 +646,8 @@ class AcceptedParticipantRemoveSelect(discord.ui.Select):
         await self._finish(interaction, notice)
 
 
-class ReopenRecruitmentButton(discord.ui.Button):
-    """관리하기 메뉴에서 마감된 모집을 다시 여는 Button입니다."""
-
-    def __init__(
-        self,
-        cog: "RecruitmentCog",
-        recruitment_id: int,
-        channel_id: int,
-        message_id: int,
-    ) -> None:
-        super().__init__(label="마감 취소", style=discord.ButtonStyle.primary)
-        self.cog = cog
-        self.recruitment_id = recruitment_id
-        self.channel_id = channel_id
-        self.message_id = message_id
-
-    async def _finish(self, interaction: discord.Interaction, message: str) -> None:
-        try:
-            await interaction.edit_original_response(content=message, view=None)
-        except discord.HTTPException:
-            await interaction.followup.send(message, ephemeral=True)
-
-    async def callback(self, interaction: discord.Interaction) -> None:
-        await interaction.response.defer()
-
-        recruitment = await self.cog.get_recruitment_by_id(self.recruitment_id)
-        if recruitment is None:
-            await self._finish(interaction, "모집 정보를 찾을 수 없습니다.")
-            return
-        if not await self.cog.is_recruitment_owner(
-            self.recruitment_id, interaction.user.id
-        ):
-            await self._finish(interaction, "모집 소유자만 마감을 취소할 수 있습니다.")
-            return
-        if recruitment["status"] != STATUS_CLOSED:
-            await self._finish(interaction, "이미 모집 중인 글입니다.")
-            return
-
-        await self.cog.reopen_recruitment(self.recruitment_id)
-        message_notice = await self.cog.edit_recruitment_message(
-            self.channel_id, self.message_id
-        )
-
-        notice = "모집 마감을 취소했습니다. 신청/마감 버튼이 다시 활성화되었습니다."
-        if message_notice:
-            notice += f"\n{message_notice}"
-        await self._finish(interaction, notice)
-
-
 class AcceptedParticipantManageView(discord.ui.View):
-    """관리하기 버튼에서 승인 참가자 제거와 마감 취소를 처리하는 Ephemeral View입니다."""
+    """관리하기 버튼에서 승인 참가자 제거를 처리하는 Ephemeral View입니다."""
 
     def __init__(
         self,
@@ -692,7 +657,6 @@ class AcceptedParticipantManageView(discord.ui.View):
         message_id: int,
         participants: list[dict],
         guild: discord.Guild,
-        recruitment_status: str,
     ) -> None:
         super().__init__(timeout=120)
         self.cog = cog
@@ -702,10 +666,6 @@ class AcceptedParticipantManageView(discord.ui.View):
                 AcceptedParticipantRemoveSelect(
                     cog, recruitment_id, channel_id, message_id, participants, guild
                 )
-            )
-        if recruitment_status == STATUS_CLOSED:
-            self.add_item(
-                ReopenRecruitmentButton(cog, recruitment_id, channel_id, message_id)
             )
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
@@ -993,10 +953,7 @@ class RecruitmentCog(commands.Cog):
         self.bot.add_view(RecruitmentView(self))
 
     def build_recruitment_view(self, recruitment) -> RecruitmentView:
-        view = RecruitmentView(self)
-        if recruitment is not None and recruitment["status"] == STATUS_CLOSED:
-            view.disable_for_closed_recruitment()
-        return view
+        return RecruitmentView(self, recruitment)
 
     async def resolve_recruitment_channel(
         self, interaction: discord.Interaction
