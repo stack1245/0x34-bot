@@ -188,11 +188,28 @@ class Database:
         return self.connection
 
     async def execute(self, query: str, params: Iterable[Any] = ()) -> aiosqlite.Cursor:
-        """INSERT, UPDATE, DELETE처럼 결과 행이 중요하지 않은 쿼리를 실행합니다."""
+        """INSERT, UPDATE, DELETE처럼 결과 행이 중요하지 않은 쿼리를 실행합니다.
+
+        Args:
+            query: SQL statement to execute.
+            params: Positional parameters bound into the SQL statement.
+
+        Returns:
+            The SQLite cursor returned by aiosqlite.
+
+        Raises:
+            Exception: Re-raises database exceptions after rolling back the open
+                transaction state.
+        """
         connection = self._require_connection()
-        cursor = await connection.execute(query, tuple(params))
-        await connection.commit()
-        return cursor
+        try:
+            cursor = await connection.execute(query, tuple(params))
+        except Exception:
+            await connection.rollback()
+            raise
+        else:
+            await connection.commit()
+            return cursor
 
     @asynccontextmanager
     async def transaction(self) -> AsyncIterator[aiosqlite.Connection]:

@@ -48,6 +48,19 @@ class RecruitmentRepositoryProtocol(Protocol):
 
     async def fetch_by_id(self, recruitment_id: int) -> RecruitmentRow | None: ...
 
+    async def fetch_by_id_and_guild(
+        self, recruitment_id: int, guild_id: int
+    ) -> RecruitmentRow | None: ...
+
+    async def fetch_edit_candidates(
+        self,
+        *,
+        guild_id: int,
+        user_id: int,
+        open_status: RecruitmentStatus,
+        limit: int,
+    ) -> list[RecruitmentRow]: ...
+
     async def fetch_author_context(
         self, recruitment_id: int
     ) -> RecruitmentAuthorContext | None: ...
@@ -167,6 +180,58 @@ class SQLiteRecruitmentRepository:
             (recruitment_id,),
         )
         return self._recruitment_from_row(row)
+
+    async def fetch_by_id_and_guild(
+        self, recruitment_id: int, guild_id: int
+    ) -> RecruitmentRow | None:
+        """Fetch a recruitment scoped to one Discord guild.
+
+        Args:
+            recruitment_id: Primary key of the recruitment.
+            guild_id: Discord guild snowflake that must own the row.
+
+        Returns:
+            The recruitment row when found, otherwise None.
+        """
+        row = await self.database.fetch_one(
+            "SELECT * FROM recruitments WHERE id = ? AND guild_id = ?",
+            (recruitment_id, guild_id),
+        )
+        return self._recruitment_from_row(row)
+
+    async def fetch_edit_candidates(
+        self,
+        *,
+        guild_id: int,
+        user_id: int,
+        open_status: RecruitmentStatus,
+        limit: int,
+    ) -> list[RecruitmentRow]:
+        """Fetch recruitments visible in the edit selector.
+
+        Args:
+            guild_id: Discord guild snowflake that scopes the query.
+            user_id: Discord user id requesting editable rows.
+            open_status: Status value that marks rows editable by everyone.
+            limit: Maximum number of rows to return.
+
+        Returns:
+            Ordered recruitment rows visible to the requester.
+        """
+        rows = await self.database.fetch_all(
+            """
+            SELECT * FROM recruitments
+            WHERE guild_id = ? AND (author_id = ? OR status = ?)
+            ORDER BY created_at DESC
+            LIMIT ?
+            """,
+            (guild_id, user_id, open_status, limit),
+        )
+        return [
+            recruitment
+            for row in rows
+            if (recruitment := self._recruitment_from_row(row)) is not None
+        ]
 
     async def fetch_author_context(
         self, recruitment_id: int

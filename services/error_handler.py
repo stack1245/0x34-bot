@@ -6,6 +6,8 @@ import discord
 from discord import app_commands
 from discord.ext import commands
 
+from services.recruitment import RecruitmentError
+
 
 class BotErrorHandler:
     """명령어와 이벤트 오류 응답을 중앙에서 처리합니다."""
@@ -36,6 +38,10 @@ class BotErrorHandler:
         elif isinstance(original, discord.HTTPException):
             message = (
                 "Discord API가 일시적으로 실패했습니다. 잠시 후 다시 시도해 주세요."
+            )
+        elif isinstance(original, RecruitmentError):
+            message = (
+                "모집 처리 중 상태가 변경되었습니다. 새로고침 후 다시 시도해 주세요."
             )
         else:
             message = "예상치 못한 오류가 발생했습니다. 로그를 확인해 주세요."
