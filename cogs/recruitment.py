@@ -585,12 +585,15 @@ class AcceptedParticipantRemoveSelect(discord.ui.Select):
             user_id = int(row["user_id"])
             member = guild.get_member(user_id)
             label = (
-                member.display_name if member is not None else f"사용자 {user_id}"
+                member.display_name
+                if member is not None
+                else f"알 수 없는 사용자 ({user_id})"
             )[:100]
+            description = f"@{member.name}"[:100] if member is not None else None
             options.append(
                 discord.SelectOption(
                     label=label,
-                    description=f"ID {user_id} · 승인 참가자에서 제거"[:100],
+                    description=description,
                     value=str(user_id),
                 )
             )
