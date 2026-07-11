@@ -26,6 +26,7 @@ from services.recruitment_embeds import RecruitmentEmbedFactory
 from services.recruitment_messages import RecruitmentMessageService
 from services.recruitment_models import (
     ParticipantStatus,
+    RecruitmentParticipant,
     RecruitmentRecord,
     RecruitmentRow,
 )
@@ -99,6 +100,35 @@ class RecruitmentView(discord.ui.View):
             )
             return None
         return recruitment
+
+    async def build_participant_remove_options(
+        self,
+        guild: discord.Guild,
+        participants: list[RecruitmentParticipant],
+    ) -> list[discord.SelectOption]:
+        """REST API로 참가자를 조회해 제거 Select 옵션을 만듭니다."""
+        options: list[discord.SelectOption] = []
+        for row in participants[:25]:
+            user_id = int(row["user_id"])
+            try:
+                member = await guild.fetch_member(user_id)
+            except (discord.NotFound, discord.HTTPException):
+                member = None
+
+            options.append(
+                discord.SelectOption(
+                    label=(
+                        member.display_name
+                        if member is not None
+                        else f"알 수 없는 사용자 ({user_id})"
+                    )[:100],
+                    description=(
+                        f"@{member.name}"[:100] if member is not None else None
+                    ),
+                    value=str(user_id),
+                )
+            )
+        return options
 
     async def get_open_recruitment(
         self, interaction: discord.Interaction
@@ -199,13 +229,18 @@ class RecruitmentView(discord.ui.View):
             )
             return
 
+        if accepted_participants:
+            await interaction.response.defer(ephemeral=True)
+        options = await self.build_participant_remove_options(
+            interaction.guild, accepted_participants
+        )
+
         view = AcceptedParticipantManageView(
             self.cog,
             int(recruitment["id"]),
             int(recruitment["channel_id"]),
             int(recruitment["message_id"]),
-            accepted_participants,
-            interaction.guild,
+            options,
         )
         overflow_text = (
             "\n승인 참가자가 25명을 넘어서 목록에는 25명만 표시합니다."
@@ -217,11 +252,11 @@ class RecruitmentView(discord.ui.View):
             if accepted_participants
             else "제거할 승인 참가자가 없습니다."
         )
-        await interaction.response.send_message(
-            f"{thread_text}\n{remove_text}{overflow_text}",
-            view=view,
-            ephemeral=True,
-        )
+        content = f"{thread_text}\n{remove_text}{overflow_text}"
+        if interaction.response.is_done():
+            await interaction.followup.send(content, view=view, ephemeral=True)
+        else:
+            await interaction.response.send_message(content, view=view, ephemeral=True)
 
     @discord.ui.button(
         label="모집 마감",
@@ -572,31 +607,12 @@ class AcceptedParticipantRemoveSelect(discord.ui.Select):
         recruitment_id: int,
         channel_id: int,
         message_id: int,
-        participants: list[dict[str, object]],
-        guild: discord.Guild,
+        options: list[discord.SelectOption],
     ) -> None:
         self.cog = cog
         self.recruitment_id = recruitment_id
         self.channel_id = channel_id
         self.message_id = message_id
-
-        options: list[discord.SelectOption] = []
-        for row in participants[:25]:
-            user_id = int(row["user_id"])
-            member = guild.get_member(user_id)
-            label = (
-                member.display_name
-                if member is not None
-                else f"알 수 없는 사용자 ({user_id})"
-            )[:100]
-            description = f"@{member.name}"[:100] if member is not None else None
-            options.append(
-                discord.SelectOption(
-                    label=label,
-                    description=description,
-                    value=str(user_id),
-                )
-            )
 
         super().__init__(
             placeholder="제거할 승인 참가자를 선택하세요.",
@@ -668,16 +684,15 @@ class AcceptedParticipantManageView(discord.ui.View):
         recruitment_id: int,
         channel_id: int,
         message_id: int,
-        participants: list[dict],
-        guild: discord.Guild,
+        options: list[discord.SelectOption],
     ) -> None:
         super().__init__(timeout=120)
         self.cog = cog
         self.recruitment_id = recruitment_id
-        if participants:
+        if options:
             self.add_item(
                 AcceptedParticipantRemoveSelect(
-                    cog, recruitment_id, channel_id, message_id, participants, guild
+                    cog, recruitment_id, channel_id, message_id, options
                 )
             )
 
