@@ -60,7 +60,7 @@ def load_settings() -> Settings:
     return Settings(
         token=token,
         guild_id=_optional_int(os.getenv("GUILD_ID")),
-        database_path=_env_value("DB_PATH", "DATABASE_PATH", default="data/0x34.sqlite3"),
+        database_path=_env_value("DB_PATH", "DATABASE_PATH", default="data/bot.db"),
         timezone=os.getenv("TIMEZONE", "Asia/Seoul"),
         schedule_channel_id=_optional_int(os.getenv("SCHEDULE_CHANNEL_ID")),
         tournament_channel_id=_optional_int(os.getenv("TOURNAMENT_CHANNEL_ID")),

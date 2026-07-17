@@ -99,7 +99,7 @@ python bot.py
 
 ## Railway 배포
 
-Railway는 `Procfile`의 `worker: python bot.py`를 사용해 봇을 실행합니다. SQLite 파일을 장기간 보관해야 한다면 Railway Volume을 만들고 `DB_PATH`를 Volume 경로로 설정하세요. 예를 들어 `/app/data/0x34.sqlite3`처럼 지정하면 됩니다. 기존 `DATABASE_PATH`도 하위 호환으로 지원하지만, 둘 다 있으면 `DB_PATH`가 우선합니다. 운영 규모가 커지면 PostgreSQL로 교체하는 편이 안전합니다.
+Railway는 `Procfile`의 `worker: python bot.py`를 사용해 봇을 실행합니다. SQLite 파일을 장기간 보관해야 한다면 Railway Volume을 만들고 `DB_PATH`를 Volume 경로로 설정하세요. 예를 들어 `/app/data/bot.db`처럼 지정하면 됩니다. 기존 `DATABASE_PATH`도 하위 호환으로 지원하지만, 둘 다 있으면 `DB_PATH`가 우선합니다. 운영 규모가 커지면 PostgreSQL로 교체하는 편이 안전합니다.
 
 ## Gemini 설정
 
